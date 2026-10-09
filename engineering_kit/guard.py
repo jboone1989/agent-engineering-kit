@@ -17,7 +17,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 PY_MODULE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
 TS_MODULE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*(/[a-zA-Z_][a-zA-Z0-9_-]*)*$")
 PACKAGE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
@@ -266,10 +266,16 @@ def check(root: Path, policy: dict, arch_only: bool = False) -> dict:
         else:
             config = Path(temp) / ".dependency-cruiser.cjs"
             config.write_text(render_typescript(policy), encoding="utf-8")
+            source = root / policy["source"]
+            extensions = {".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs"}
+            files = sorted(p.relative_to(root).as_posix() for p in source.rglob("*")
+                           if p.is_file() and p.suffix in extensions and not p.name.endswith(".d.ts"))
+            if not files:
+                raise PolicyError("No TypeScript/JavaScript source files found; refusing an empty architecture scan")
             arch = ["npx", "--no-install", "depcruise", "--config", str(config)]
             if (root / "tsconfig.json").is_file():
                 arch += ["--ts-config", "tsconfig.json"]
-            arch += [policy["source"]]
+            arch += files
         results.append(_run("architecture", arch, root, env, timeout_seconds))
     if not arch_only:
         for index, command in enumerate(policy["tests"], 1):
