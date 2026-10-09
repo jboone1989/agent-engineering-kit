@@ -100,13 +100,13 @@ class RealAdapterTests(unittest.TestCase):
             (base / 'src/learning/index.ts').write_text('export const y = 2;\n')
             # npx resolves tools from parent node_modules when tests are inside the repo.
             self._check(base, 'TS clean', 0)
-            (base / 'src/learning/index.ts').write_text("import { x } from '../publishing';\nexport const y = x;\n")
+            (base / 'src/learning/index.ts').write_text("import { x } from '../publishing/index.ts';\nexport const y = x;\n")
             self._check(base, 'TS forbidden import', 1)
             (base / 'src/learning/index.ts').write_text('export const y = 2;\n')
             self._check(base, 'TS clean again', 0)
             (base / 'src/publishing/index.ts').write_text('export type PublishingId = string;\n')
             (base / 'src/learning/index.ts').write_text(
-                "import type { PublishingId } from '../publishing';\n"
+                "import type { PublishingId } from '../publishing/index.ts';\n"
                 'export type LearningId = PublishingId;\n')
             self._check(base, 'TS forbidden type-only import', 1)
             (base / 'src/learning/index.ts').write_text('export const y = 2;\n')
