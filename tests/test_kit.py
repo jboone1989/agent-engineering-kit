@@ -1,0 +1,397 @@
+import configparser
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from engineering_kit.cli import main as cli_main, parse_rules
+from engineering_kit.guard import (PolicyError, check, load_policy, missing_modules,
+                                   render_python, render_typescript, validate_policy)
+
+
+class KitTests(unittest.TestCase):
+    def policy(self, lang="python"):
+        return {
+            "schema_version": 1, "language": lang,
+            "package": "sample" if lang == "python" else None,
+            "source": "src" if lang == "typescript" else None,
+            "forbidden": [["learning", "publishing"]],
+            "tests": [[sys.executable, "-c", "print('tested')"]],
+        }
+
+    def setup_example(self, root, lang="python"):
+        p = self.policy(lang)
+        folder = root / ("src/sample" if lang == "python" else "src")
+        for name in ("learning", "publishing"):
+            mod = folder / name
+            mod.mkdir(parents=True)
+            (mod / ("__init__.py" if lang == "python" else "index.ts")).write_text("", encoding="utf-8")
+        config = root / ".agent-engineering" / "policy.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps(p), encoding="utf-8")
+        return p
+
+    def test_policies_are_validated(self):
+        self.assertEqual(validate_policy(self.policy())["language"], "python")
+        for change in ({"schema_version": 5}, {"tests": "pytest"},
+                       {"forbidden": []}, {"forbidden": [["a", "a"]]},
+                       {"package": "../bad"}):
+            with self.subTest(change=change), self.assertRaises(PolicyError):
+                validate_policy({**self.policy(), **change})
+
+    def test_prevents_unsafe_source_and_rule_values(self):
+        for path in ("../foo", "/absolute", "src/../bad", "src space"):
+            with self.subTest(path=path), self.assertRaises(PolicyError):
+                validate_policy({**self.policy("typescript"), "source": path})
+        for rule in ("bad", "a:a", "../x:y", "a:b:c"):
+            with self.subTest(rule=rule), self.assertRaises(ValueError):
+                parse_rules([rule], "python")
+
+    def test_supports_nested_module_paths(self):
+        self.assertEqual(parse_rules(["domain.learning:adapters.x"], "python"),
+                         [["domain.learning", "adapters.x"]])
+        self.assertEqual(parse_rules(["features/learning:adapters/transport"], "typescript"),
+                         [["features/learning", "adapters/transport"]])
+
+    def test_python_config_parses(self):
+        cfg = configparser.ConfigParser()
+        cfg.read_string(render_python(self.policy()))
+        self.assertEqual(cfg["importlinter"]["root_package"], "sample")
+        self.assertEqual(cfg["importlinter:contract:boundary-1"]["source_modules"], "sample.learning")
+
+    def test_python_cycle_contract_is_explicit_and_backwards_compatible(self):
+        self.assertNotIn("acyclic_siblings", render_python(self.policy()))
+        text = render_python({**self.policy(), "check_cycles": True})
+        cfg = configparser.ConfigParser()
+        cfg.read_string(text)
+        self.assertEqual(cfg["importlinter:contract:no-sibling-cycles"]["type"], "acyclic_siblings")
+        self.assertEqual(cfg["importlinter:contract:no-sibling-cycles"]["depth"], "0")
+        with self.assertRaisesRegex(PolicyError, "check_cycles"):
+            validate_policy({**self.policy(), "check_cycles": "false"})
+
+    def test_typescript_config_is_valid_javascript(self):
+        rendered = render_typescript(self.policy("typescript"))
+        self.assertIn('"no-circular"', rendered)
+        self.assertIn('"no-learning-to-publishing"', rendered)
+        self.assertIn('"tsPreCompilationDeps": true', rendered)
+        self.assertNotIn('"no-circular"', render_typescript({**self.policy("typescript"), "check_cycles": False}))
+        if shutil.which("node"):
+            with tempfile.TemporaryDirectory() as temp:
+                config = Path(temp) / "test.cjs"
+                config.write_text(rendered, encoding="utf-8")
+                subprocess.run(["node", "--check", str(config)], check=True)
+
+    def test_guard_refuses_empty_module_names(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.policy()
+            self.assertEqual(missing_modules(root, p), ["learning", "publishing"])
+            with self.assertRaises(PolicyError):
+                check(root, p)
+
+    def test_guard_detects_nested_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.setup_example(root)
+            p["forbidden"] = [["learning.adapters", "publishing"]]
+            (root / "src/sample/learning/adapters").mkdir()
+            self.assertEqual(missing_modules(root, p), [])
+
+    def test_init_generates_single_policy_and_ci(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ret = cli_main(["init", str(root), "--language", "python", "--package", "sample",
+                            "--forbid", "learning:publishing", "--test", "python -m unittest"])
+            self.assertEqual(ret, 0)
+            policy = load_policy(root)
+            self.assertEqual(policy["tests"], [["python", "-m", "unittest"]])
+            self.assertTrue(policy["check_cycles"])
+            self.assertTrue((root / "AGENTS.md").exists())
+            self.assertIn("@AGENTS.md", (root / "CLAUDE.md").read_text())
+            self.assertTrue((root / ".agent-engineering/guard.py").exists())
+            ci = (root / ".github/workflows/engineering-guard.yml").read_text()
+            self.assertIn("python .agent-engineering/guard.py check", ci)
+            self.assertIn("import-linter", ci)
+            self.assertNotIn("pip install agent-engineering-kit", ci)
+            self.assertFalse((root / ".importlinter").exists())
+            self.assertFalse((root / ".dependency-cruiser.cjs").exists())
+
+    def test_init_never_overwrites_existing_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            existing = root / "AGENTS.md"
+            existing.write_text("CUSTOM", encoding="utf-8")
+            ret = cli_main(["init", str(root), "--language", "python", "--package", "sample",
+                            "--forbid", "learning:publishing", "--test", "python -m unittest"])
+            self.assertEqual(ret, 2)
+            self.assertEqual(existing.read_text(), "CUSTOM")
+
+    def test_typescript_scaffold(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ret = cli_main(["init", str(root), "--language", "typescript", "--source", "src",
+                            "--forbid", "features/learning:infra/transport", "--test", "npm test"])
+            self.assertEqual(ret, 0)
+            self.assertEqual(load_policy(root)["forbidden"], [["features/learning", "infra/transport"]])
+            workflow = (root / ".github/workflows/engineering-guard.yml").read_text()
+            self.assertIn("npm ci", workflow)
+
+    def test_check_runs_architecture_and_behavior(self):
+        if os.name == "nt":
+            self.skipTest("fake POSIX executable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.setup_example(root)
+            binpath = root / "bin"
+            binpath.mkdir()
+            fake = binpath / "lint-imports"
+            fake.write_text("#!/bin/sh\ncase \"$1\" in --config) test -f \"$2\";; *) exit 7;; esac\n", encoding="utf-8")
+            fake.chmod(0o755)
+            old = os.environ.get("PATH", "")
+            try:
+                os.environ["PATH"] = str(binpath) + os.pathsep + old
+                result = check(root, p)
+            finally:
+                os.environ["PATH"] = old
+            self.assertTrue(result["passed"])
+            self.assertEqual([c["name"] for c in result["checks"]], ["architecture", "behavior-1"])
+
+    def test_behavior_failure_fails_gate_even_if_architecture_passes(self):
+        if os.name == "nt":
+            self.skipTest("fake POSIX executable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.setup_example(root)
+            p["tests"] = [[sys.executable, "-c", "import sys; sys.exit(4)"]]
+            fake = root / "lint-imports"
+            fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake.chmod(0o755)
+            old = os.environ.get("PATH", "")
+            try:
+                os.environ["PATH"] = str(root) + os.pathsep + old
+                result = check(root, p)
+            finally:
+                os.environ["PATH"] = old
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["checks"][1]["exit_code"], 4)
+
+    def test_missing_tests_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.setup_example(root)
+            p["tests"] = []
+            with self.assertRaisesRegex(PolicyError, "behavior tests"):
+                check(root, p)
+
+    def test_cli_invalid_rule_is_a_parse_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaises(SystemExit) as cm:
+                cli_main(["init", temp, "--language", "python", "--package", "ok",
+                          "--forbid", "x:y;rm -rf /"])
+            self.assertEqual(cm.exception.code, 2)
+
+
+    def test_sync_safe_and_does_not_change_project_policy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            args = ["init", str(root), "--language", "python", "--package", "sample",
+                    "--forbid", "learning:publishing", "--test", "python -m unittest"]
+            self.assertEqual(cli_main(args), 0)
+            policy_path = root / ".agent-engineering/policy.json"
+            before = policy_path.read_text()
+            self.assertEqual(cli_main(["sync", str(root)]), 0)
+            self.assertEqual(policy_path.read_text(), before)
+            ci = root / ".github/workflows/engineering-guard.yml"
+            ci.write_text(ci.read_text() + "# local customization\n")
+            self.assertEqual(cli_main(["sync", str(root)]), 2)
+            self.assertIn("local customization", ci.read_text())
+            self.assertEqual(policy_path.read_text(), before)
+
+    def test_installed_standalone_guard_renders_config(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.setup_example(root)
+            args = ["init", str(root), "--language", "python", "--package", "sample",
+                    "--forbid", "learning:publishing", "--test", "python -m unittest"]
+            self.assertEqual(cli_main(args), 2)  # Existing policy must not be clobbered
+            result = subprocess.run([sys.executable, str(root / ".agent-engineering/guard.py"),
+                                     "render-config", "--root", str(root)],
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("root_package = sample", result.stdout)
+
+    def test_architecture_failure_fails_gate_even_when_behavior_passes(self):
+        if os.name == "nt":
+            self.skipTest("fake POSIX executable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.setup_example(root)
+            fake = root / "lint-imports"
+            fake.write_text("#!/bin/sh\nexit 5\n", encoding="utf-8")
+            fake.chmod(0o755)
+            old = os.environ.get("PATH", "")
+            try:
+                os.environ["PATH"] = str(root) + os.pathsep + old
+                result = check(root, p)
+            finally:
+                os.environ["PATH"] = old
+            self.assertFalse(result["passed"])
+            self.assertEqual([x["passed"] for x in result["checks"]], [False, True])
+
+    def test_typescript_check_invokes_native_tool(self):
+        if os.name == "nt":
+            self.skipTest("fake POSIX executable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.setup_example(root, "typescript")
+            (root / "tsconfig.json").write_text('{"compilerOptions": {}}')
+            fake = root / "npx"
+            fake.write_text("#!/bin/sh\n[ \"$1\" = \"--no-install\" ] || exit 8\n"
+                            "[ \"$2\" = \"depcruise\" ] || exit 9\nexit 0\n")
+            fake.chmod(0o755)
+            old = os.environ.get("PATH", "")
+            try:
+                os.environ["PATH"] = str(root) + os.pathsep + old
+                result = check(root, p)
+            finally:
+                os.environ["PATH"] = old
+            self.assertTrue(result["passed"])
+
+    def test_allowlist_expands_to_forbidden_edges(self):
+        from engineering_kit.guard import forbidden_pairs
+        policy = self.policy()
+        policy["forbidden"] = []
+        policy["modules"] = ["learning", "publishing", "contracts"]
+        policy["allowed_dependencies"] = [["learning", "contracts"], ["publishing", "contracts"]]
+        validate_policy(policy)
+        forbidden = forbidden_pairs(policy)
+        self.assertEqual(len(forbidden), 4)
+        self.assertIn(["learning", "publishing"], forbidden)
+        self.assertIn(["contracts", "learning"], forbidden)
+        self.assertNotIn(["learning", "contracts"], forbidden)
+        self.assertIn("sample.contracts", render_python(policy))
+        self.assertIn('no-contracts-to-learning', render_typescript({**policy, "language": "typescript", "package": None, "source": "src"}))
+
+    def test_allowlist_rejects_unknown_conflicting_and_duplicate_edges(self):
+        policy = self.policy()
+        policy["modules"] = ["learning", "publishing"]
+        for allowed in ([["learning", "publishing"]], [["missing", "learning"]],
+                        [["learning", "learning"]], [["publishing", "learning"], ["publishing", "learning"]]):
+            with self.subTest(allowed=allowed), self.assertRaises(PolicyError):
+                validate_policy({**policy, "allowed_dependencies": allowed})
+
+    def test_cli_initializes_allowlist_policy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            result = cli_main(["init", temp, "--language", "python", "--package", "sample",
+                               "--module", "learning", "--module", "publishing",
+                               "--allow", "learning:publishing", "--test", "python -m unittest"])
+            self.assertEqual(result, 0)
+            policy = load_policy(Path(temp))
+            self.assertEqual(policy["allowed_dependencies"], [["learning", "publishing"]])
+            self.assertEqual(policy["forbidden"], [])
+
+    def test_allowlist_detects_new_untracked_module(self):
+        from engineering_kit.guard import ungoverned_modules
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.setup_example(root)
+            p["forbidden"] = []
+            p["modules"] = ["learning", "publishing"]
+            p["allowed_dependencies"] = []
+            (root / "src/sample/rogue.py").write_text("VALUE = 1")
+            self.assertEqual(ungoverned_modules(root, p), ["rogue"])
+            with self.assertRaisesRegex(PolicyError, "unguarded"):
+                check(root, p)
+            p["unmanaged_modules"] = ["rogue"]
+            self.assertEqual(ungoverned_modules(root, p), [])
+            p["module_coverage"] = "off"
+            self.assertEqual(ungoverned_modules(root, p), [])
+
+    def test_allowlist_rejects_invalid_coverage_exceptions(self):
+        p = self.policy()
+        p["modules"] = ["learning", "publishing"]
+        p["allowed_dependencies"] = []
+        for change in ({"unmanaged_modules": ["learning"]},
+                       {"module_coverage": "maybe"},
+                       {"unmanaged_modules": ["../bad"]}):
+            with self.subTest(change=change), self.assertRaises(PolicyError):
+                validate_policy({**p, **change})
+
+    def test_json_report_contains_policy_hash(self):
+        from engineering_kit.guard import policy_fingerprint
+        p = self.policy()
+        self.assertEqual(len(policy_fingerprint(p)), 64)
+        self.assertEqual(policy_fingerprint(p), policy_fingerprint(dict(reversed(list(p.items())))))
+
+    def test_typescript_untracked_module_is_reported(self):
+        from engineering_kit.guard import ungoverned_modules
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.setup_example(root, "typescript")
+            p["forbidden"] = []
+            p["modules"] = ["learning", "publishing"]
+            p["allowed_dependencies"] = []
+            (root / "src/rogue.ts").write_text("export const value = 1;", encoding="utf-8")
+            self.assertEqual(ungoverned_modules(root, p), ["rogue"])
+
+    def test_check_policy_error_overwrites_stale_success_report(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            report = root / 'report.json'
+            report.write_text('{"passed": true}', encoding='utf-8')
+            result = subprocess.run([sys.executable, str(ROOT / 'engineering_kit/guard.py'),
+                                     'check', '--root', str(root), '--json-report', str(report)],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            payload = json.loads(report.read_text(encoding='utf-8'))
+            self.assertFalse(payload['passed'])
+            self.assertIn('error', payload)
+
+    def test_command_timeout_policy_is_validated(self):
+        for invalid in (0, -1, 3601, True, 1.5, '1'):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(PolicyError, 'command_timeout_seconds'):
+                validate_policy({**self.policy(), 'command_timeout_seconds': invalid})
+        self.assertEqual(validate_policy({**self.policy(), 'command_timeout_seconds': 3})['command_timeout_seconds'], 3)
+
+    def test_timeout_fails_closed_and_behavior_tests_still_run(self):
+        if os.name == 'nt':
+            self.skipTest('fake POSIX executable')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            policy = self.setup_example(root)
+            policy['command_timeout_seconds'] = 1
+            policy['tests'] = [['/bin/true']]
+            fake = root / 'lint-imports'
+            fake.write_text('#!/bin/sh\nsleep 3\n', encoding='utf-8')
+            fake.chmod(0o755)
+            old = os.environ.get('PATH', '')
+            try:
+                os.environ['PATH'] = str(root) + os.pathsep + old
+                result = check(root, policy)
+            finally:
+                os.environ['PATH'] = old
+            self.assertFalse(result['passed'])
+            self.assertEqual(result['checks'][0]['exit_code'], 124)
+            self.assertTrue(result['checks'][1]['passed'])
+
+    def test_typescript_doctor_requires_the_real_adapter(self):
+        from engineering_kit.guard import doctor
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            policy = self.setup_example(root, 'typescript')
+            (root / '.github/workflows').mkdir(parents=True)
+            (root / '.github/workflows/engineering-guard.yml').write_text('name: test\n')
+            with patch('engineering_kit.guard.shutil.which', return_value='/usr/bin/npx'):
+                with patch('engineering_kit.guard.subprocess.run', return_value=subprocess.CompletedProcess([], 1)):
+                    self.assertEqual(doctor(root, policy), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

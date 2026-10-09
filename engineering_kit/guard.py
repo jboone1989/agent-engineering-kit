@@ -1,0 +1,349 @@
+"""A tiny standalone architecture + behavior-test gate. Python stdlib only.
+
+This module is also vendored into initialized projects, so their CI has no
+runtime dependency on a not-yet-published package.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+VERSION = "0.3.2"
+PY_MODULE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
+TS_MODULE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*(/[a-zA-Z_][a-zA-Z0-9_-]*)*$")
+PACKAGE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
+SOURCE = re.compile(r"^[A-Za-z0-9_./-]+$")
+
+
+class PolicyError(ValueError):
+    """An invalid, inconsistent or incomplete project policy."""
+
+
+def _source_path(value: str) -> str:
+    if not isinstance(value, str) or not SOURCE.fullmatch(value):
+        raise PolicyError("source must be a simple relative path")
+    result = Path(value)
+    if result.is_absolute() or any(part in (".", "..") for part in value.split("/")):
+        raise PolicyError("source cannot leave the project directory")
+    return value.rstrip("/")
+
+
+def validate_policy(value: object) -> dict:
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        raise PolicyError("policy must be an object with schema_version=1")
+    lang = value.get("language")
+    if lang not in ("python", "typescript"):
+        raise PolicyError("language must be python or typescript")
+    if lang == "python" and not (isinstance(value.get("package"), str) and PACKAGE.fullmatch(value["package"])):
+        raise PolicyError("Python requires a valid dotted import package")
+    if lang == "typescript":
+        _source_path(value.get("source"))
+    if not isinstance(value.get("check_cycles", False), bool):
+        raise PolicyError("check_cycles must be a boolean")
+    timeout = value.get("command_timeout_seconds", 900)
+    if type(timeout) is not int or not 1 <= timeout <= 3600:
+        raise PolicyError("command_timeout_seconds must be an integer between 1 and 3600")
+    rules = value.get("forbidden")
+    if not isinstance(rules, list):
+        raise PolicyError("forbidden must be a list of module pairs")
+    seen = set()
+    module_pattern = PY_MODULE if lang == "python" else TS_MODULE
+    for pair in rules:
+        if (not isinstance(pair, list) or len(pair) != 2 or
+                any(not isinstance(m, str) or not module_pattern.fullmatch(m) for m in pair) or pair[0] == pair[1]):
+            raise PolicyError("forbidden must contain distinct [source, target] module pairs")
+        if tuple(pair) in seen:
+            raise PolicyError("duplicate forbidden rule: " + repr(pair))
+        seen.add(tuple(pair))
+    modules = value.get("modules")
+    allowed = value.get("allowed_dependencies")
+    if modules is not None or allowed is not None:
+        if not isinstance(modules, list) or len(modules) < 2 or not all(
+                isinstance(m, str) and module_pattern.fullmatch(m) for m in modules):
+            raise PolicyError("modules must contain at least two valid module names")
+        if len(modules) != len(set(modules)):
+            raise PolicyError("duplicate declared module")
+        if not isinstance(allowed, list):
+            raise PolicyError("allowed_dependencies must be a list")
+        for pair in allowed:
+            if (not isinstance(pair, list) or len(pair) != 2 or
+                    pair[0] == pair[1] or any(m not in modules for m in pair)):
+                raise PolicyError("allowed_dependencies contains an undeclared or invalid edge")
+        if len(allowed) != len({tuple(pair) for pair in allowed}):
+            raise PolicyError("duplicate allowed dependency")
+        if any(pair in allowed for pair in rules):
+            raise PolicyError("same dependency cannot be both allowed and forbidden")
+        coverage = value.get("module_coverage", "top_level")
+        if coverage not in ("top_level", "off"):
+            raise PolicyError("module_coverage must be top_level or off")
+        unmanaged = value.get("unmanaged_modules", [])
+        if (not isinstance(unmanaged, list) or any(
+                not isinstance(m, str) or not module_pattern.fullmatch(m) for m in unmanaged)):
+            raise PolicyError("unmanaged_modules must be module names")
+        if len(unmanaged) != len(set(unmanaged)):
+            raise PolicyError("duplicate unmanaged module")
+        if set(unmanaged) & set(modules):
+            raise PolicyError("a module cannot be declared and unmanaged")
+    elif not rules:
+        raise PolicyError("configure forbidden pairs or a modules allowlist")
+    tests = value.get("tests")
+    if not isinstance(tests, list) or any(not isinstance(t, list) or not t or any(not isinstance(s, str) or not s for s in t) for t in tests):
+        raise PolicyError("tests must be a list of non-empty argv arrays")
+    return value
+
+
+def load_policy(root: Path) -> dict:
+    path = root / ".agent-engineering" / "policy.json"
+    try:
+        return validate_policy(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PolicyError(f"cannot read {path}: {exc}") from exc
+
+
+def forbidden_pairs(policy: dict) -> list[list[str]]:
+    pairs = list(policy["forbidden"])
+    modules = policy.get("modules")
+    if modules is None:
+        return pairs
+    allowed = {tuple(edge) for edge in policy["allowed_dependencies"]}
+    for source in modules:
+        for target in modules:
+            pair = [source, target]
+            if source != target and (source, target) not in allowed and pair not in pairs:
+                pairs.append(pair)
+    return pairs
+
+
+def policy_fingerprint(policy: dict) -> str:
+    canonical = json.dumps(policy, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def render_python(policy: dict) -> str:
+    package = policy["package"]
+    lines = ["[importlinter]", f"root_package = {package}", ""]
+    for n, (source, target) in enumerate(forbidden_pairs(policy), start=1):
+        lines.extend([
+            f"[importlinter:contract:boundary-{n}]",
+            f"name = {source} must not depend on {target}",
+            "type = forbidden",
+            f"source_modules = {package}.{source}",
+            f"forbidden_modules = {package}.{target}",
+            "",
+        ])
+    if policy.get("check_cycles", False):
+        lines.extend([
+            "[importlinter:contract:no-sibling-cycles]",
+            "name = Top-level package modules must not form cycles",
+            "type = acyclic_siblings",
+            f"ancestors = {package}",
+            "depth = 0",
+            "",
+        ])
+    return "\n".join(lines)
+
+
+def render_typescript(policy: dict) -> str:
+    source = re.escape(policy["source"])
+    rules = [
+        {"name": "no-unresolved", "severity": "error", "from": {}, "to": {"couldNotResolve": True}},
+    ]
+    if policy.get("check_cycles", True):
+        rules.insert(0, {"name": "no-circular", "severity": "error", "from": {}, "to": {"circular": True}})
+    for left, right in forbidden_pairs(policy):
+        left_path, right_path = re.escape(left), re.escape(right)
+        rules.append({
+            "name": f"no-{left}-to-{right}", "severity": "error",
+            "from": {"path": rf"^{source}/{left_path}(?:/|\.)"},
+            "to": {"path": rf"^{source}/{right_path}(?:/|\.)"},
+        })
+    # Type-only imports and unused imports are real source-level dependencies.
+    # Without this option, dependency-cruiser discards them after TS compilation.
+    return "module.exports = " + json.dumps({
+        "forbidden": rules, "options": {"tsPreCompilationDeps": True},
+    }, indent=2) + ";\n"
+
+
+def missing_modules(root: Path, policy: dict) -> list[str]:
+    """Prevent a vacuous green check when configured modules do not exist."""
+    missing = []
+    names = sorted(set(policy.get("modules") or []) | {m for pair in policy["forbidden"] for m in pair})
+    if policy["language"] == "python":
+        package = Path(*policy["package"].split("."))
+        bases = [root / "src" / package, root / package]
+        for module in names:
+            if not any((base / Path(*module.split("."))).is_dir() or (base / Path(*module.split("."))).with_suffix(".py").is_file() for base in bases):
+                missing.append(module)
+    else:
+        base = root / policy["source"]
+        for module in names:
+            if not (base / module).is_dir() and not any((base / f"{module}{suffix}").is_file() for suffix in (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts")):
+                missing.append(module)
+    return missing
+
+
+def ungoverned_modules(root: Path, policy: dict) -> list[str]:
+    """Top-level source modules not governed by strict mode; no runtime imports."""
+    if "modules" not in policy or policy.get("module_coverage", "top_level") == "off":
+        return []
+    if policy["language"] == "python":
+        package = Path(*policy["package"].split("."))
+        base = next((p for p in (root / "src" / package, root / package) if p.is_dir()), None)
+        extensions = (".py",)
+        splitter = "."
+    else:
+        base = root / policy["source"]
+        extensions = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts")
+        splitter = "/"
+    if base is None or not base.is_dir():
+        raise PolicyError("package/source directory missing; module coverage cannot be checked")
+    names = set()
+    for path in base.iterdir():
+        if path.is_dir() and any(p.is_file() and p.suffix in extensions for p in path.rglob("*")):
+            names.add(path.name)
+        elif path.is_file() and path.suffix in extensions and path.stem not in ("__init__", "__main__"):
+            if not path.name.endswith(".d.ts"):
+                names.add(path.stem)
+    declared = {m.split(splitter, 1)[0] for m in policy["modules"]}
+    excluded = {m.split(splitter, 1)[0] for m in policy.get("unmanaged_modules", [])}
+    return sorted(names - declared - excluded)
+
+
+def _run(label: str, argv: list[str], root: Path, env: dict, timeout_seconds: int) -> dict:
+    print(f"CHECK {label}: {' '.join(argv)}", flush=True)
+    try:
+        completed = subprocess.run(argv, cwd=root, env=env, text=True, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, encoding="utf-8", errors="replace",
+                                   timeout=timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        completed = None
+        output = (exc.stdout or b"")
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        output += f"\ncommand exceeded {timeout_seconds}s timeout"
+        code = 124
+    except OSError as exc:
+        completed = None
+        output, code = str(exc), 127
+    else:
+        output, code = completed.stdout, completed.returncode
+    if code:
+        print(f"FAIL {label} (exit {code})", flush=True)
+        print("\n".join(output.splitlines()[-50:]), flush=True)
+    else:
+        print(f"PASS {label}", flush=True)
+    return {"name": label, "passed": code == 0, "exit_code": code}
+
+
+def check(root: Path, policy: dict, arch_only: bool = False) -> dict:
+    if not policy["tests"] and not arch_only:
+        raise PolicyError("behavior tests are not configured; set 'tests' or use --arch-only for diagnosis")
+    absent = missing_modules(root, policy)
+    if absent:
+        raise PolicyError("declared modules do not exist (refusing vacuous pass): " + ", ".join(absent))
+    ungoverned = ungoverned_modules(root, policy)
+    if ungoverned:
+        raise PolicyError("unguarded top-level modules: " + ", ".join(ungoverned) +
+                          "; declare in modules or explicitly set unmanaged_modules")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join([str(root / "src"), str(root), env.get("PYTHONPATH", "")])
+    timeout_seconds = policy.get("command_timeout_seconds", 900)
+    results = []
+    with tempfile.TemporaryDirectory(prefix="aegkit-") as temp:
+        if policy["language"] == "python":
+            config = Path(temp) / ".importlinter"
+            config.write_text(render_python(policy), encoding="utf-8")
+            arch = ["lint-imports", "--config", str(config)]
+        else:
+            config = Path(temp) / ".dependency-cruiser.cjs"
+            config.write_text(render_typescript(policy), encoding="utf-8")
+            arch = ["npx", "--no-install", "depcruise", "--config", str(config)]
+            if (root / "tsconfig.json").is_file():
+                arch += ["--ts-config", "tsconfig.json"]
+            arch += [policy["source"]]
+        results.append(_run("architecture", arch, root, env, timeout_seconds))
+    if not arch_only:
+        for index, command in enumerate(policy["tests"], 1):
+            results.append(_run(f"behavior-{index}", command, root, env, timeout_seconds))
+    return {
+        "schema_version": 1, "kit_version": VERSION, "policy_sha256": policy_fingerprint(policy),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "passed": all(r["passed"] for r in results), "checks": results,
+    }
+
+
+def doctor(root: Path, policy: dict) -> int:
+    issues = []
+    absent = missing_modules(root, policy)
+    if absent:
+        issues.append("missing modules: " + ", ".join(absent))
+    try:
+        ungoverned = ungoverned_modules(root, policy)
+        if ungoverned:
+            issues.append("unguarded modules: " + ", ".join(ungoverned))
+    except PolicyError as exc:
+        issues.append(str(exc))
+    if not policy["tests"]:
+        issues.append("no behavior tests configured")
+    binary = "lint-imports" if policy["language"] == "python" else "npx"
+    if not shutil.which(binary):
+        issues.append(f"{binary} unavailable (install language adapter dependencies)")
+    elif policy["language"] == "typescript":
+        try:
+            probe = subprocess.run(["npx", "--no-install", "depcruise", "--version"],
+                                   cwd=root, capture_output=True, timeout=15)
+            if probe.returncode:
+                issues.append("dependency-cruiser unavailable (install as project devDependency)")
+        except (OSError, subprocess.TimeoutExpired):
+            issues.append("dependency-cruiser unavailable or version probe timed out")
+    if not (root / ".github/workflows/engineering-guard.yml").is_file():
+        issues.append("CI workflow missing")
+    for issue in issues:
+        print("ISSUE:", issue)
+    if not issues:
+        print("PASS: policy, modules, checks and tool look ready; run check to verify behavior")
+    return 1 if issues else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Agent Engineering Kit project gate")
+    parser.add_argument("command", choices=("check", "doctor", "render-config"))
+    parser.add_argument("--root", type=Path, default=Path.cwd(), help="project root (default: current directory)")
+    parser.add_argument("--arch-only", action="store_true", help="diagnose architecture without behavior tests")
+    parser.add_argument("--json-report", type=Path, help="write a concise JSON result only when explicitly requested")
+    args = parser.parse_args(argv)
+    root = args.root.resolve()
+    try:
+        policy = load_policy(root)
+        if args.command == "doctor":
+            return doctor(root, policy)
+        if args.command == "render-config":
+            print(render_python(policy) if policy["language"] == "python" else render_typescript(policy))
+            return 0
+        result = check(root, policy, args.arch_only)
+        if args.json_report:
+            args.json_report.parent.mkdir(parents=True, exist_ok=True)
+            args.json_report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print("RESULT:", "PASS" if result["passed"] else "FAIL")
+        return 0 if result["passed"] else 1
+    except PolicyError as exc:
+        if args.command == "check" and args.json_report:
+            failure = {"schema_version": 1, "kit_version": VERSION, "passed": False,
+                       "error": str(exc), "checks": []}
+            args.json_report.parent.mkdir(parents=True, exist_ok=True)
+            args.json_report.write_text(json.dumps(failure, indent=2) + "\n", encoding="utf-8")
+        print("ERROR:", exc, file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

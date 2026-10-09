@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-engineering-kit"
+version = "0.3.3"
+description = "Portable architecture and behavior-test gates for AI coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Agent Engineering Kit Contributors" }]
+keywords = ["coding-agent", "architecture", "quality-gate", "ci", "dependency"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Operating System :: OS Independent",
+]
+
+[project.scripts]
+aegkit = "engineering_kit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["engineering_kit*"]
