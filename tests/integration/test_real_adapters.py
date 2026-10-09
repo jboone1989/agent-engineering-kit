@@ -22,8 +22,9 @@ def adapter_available(name: str) -> bool:
     if not found:
         return False
     if name == 'typescript':
-        return subprocess.run(['node', '-e', "require.resolve('dependency-cruiser')"],
-                              cwd=ROOT, capture_output=True).returncode == 0
+        # Exercise the actual CLI installed by npm, not Node's package export map.
+        return subprocess.run(['npx', '--no-install', 'depcruise', '--version'],
+                              cwd=ROOT, capture_output=True, timeout=20).returncode == 0
     return True
 
 
