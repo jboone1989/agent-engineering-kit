@@ -244,6 +244,31 @@ class KitTests(unittest.TestCase):
             self.assertFalse(result["passed"])
             self.assertEqual([x["passed"] for x in result["checks"]], [False, True])
 
+    def test_typescript_scans_files_not_just_directory(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            policy = self.setup_example(root, 'typescript')
+            extra = root / 'src/learning/detail.ts'
+            extra.write_text('export const answer = 42;\n')
+            with patch('engineering_kit.guard._run', return_value={'name': 'check', 'passed': True, 'exit_code': 0}) as mocked:
+                result = check(root, policy)
+            argv = mocked.call_args_list[0].args[1]
+            self.assertTrue(result['passed'])
+            self.assertIn('src/learning/index.ts', argv)
+            self.assertIn('src/learning/detail.ts', argv)
+            self.assertIn('src/publishing/index.ts', argv)
+            self.assertNotIn('src', argv)
+
+    def test_typescript_empty_scan_is_an_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            policy = self.setup_example(root, 'typescript')
+            (root / 'src/learning/index.ts').unlink()
+            (root / 'src/publishing/index.ts').unlink()
+            with self.assertRaisesRegex(PolicyError, 'empty architecture scan'):
+                check(root, policy)
+
     def test_typescript_check_invokes_native_tool(self):
         if os.name == "nt":
             self.skipTest("fake POSIX executable")
