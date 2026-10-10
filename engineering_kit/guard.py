@@ -17,7 +17,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 
-VERSION = "0.3.3"
+VERSION = "0.4.0"
 PY_MODULE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
 TS_MODULE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*(/[a-zA-Z_][a-zA-Z0-9_-]*)*$")
 PACKAGE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")

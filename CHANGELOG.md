@@ -7,6 +7,12 @@
 
 # Changelog
 
+## 0.4.0 (unreleased candidate)
+- Optional strict mode (`"strict": true`): policy loosening requires a reasoned, tamper-evident `relaxations` entry chain; CI (`--ci-base`) fails on naked relaxations and on policy edits mixed with code changes.
+- New `aegkit relax` command records every loosening with a mandatory reason.
+- Generated CI passes the base ref so strict isolation is enforced on pull requests and pushes.
+- Backward compatible: policies without `strict`/`relaxations` behave exactly as 0.3.3.
+
 ## 0.3.3 (unreleased candidate)
 - Real Import Linter 2.15 and dependency-cruiser 17 regressions verified in isolated environments: clean, violating, repaired; TypeScript type-only imports were rejected.
 - Fail closed on command timeouts (default 15 minutes; optional per-project `command_timeout_seconds` between 1 and 3600); timed out checks return exit code 124.
