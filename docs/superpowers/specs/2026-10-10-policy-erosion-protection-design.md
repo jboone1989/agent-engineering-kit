@@ -110,9 +110,9 @@ aegkit relax <project-root> --reason "..."
 `check` 新增可选参数 `--ci-base <git-ref>`，由生成的 workflow 传入；仅当 policy `strict == true` 时激活。两个子检查：
 
 **naked relaxation 检测**：
-- `git show <base>:.agent-engineering/policy.json` 取旧 policy（文件不存在按 `{}` 处理）
+- `git show <base>:.agent-engineering/policy.json` 取旧 policy（文件不存在按 `{}` 处理；存在但不可读——如 partial clone 拿不到 blob——按 fail 处理，用 `ls-tree` 区分两种情形，不依赖可本地化的 git 消息）
 - 按第 5 节枚举计算 base→current 的全部放宽型变更
-- **新增条目** = current 的 `relaxations` 中第 `len(base.relaxations)` 条之后的条目（relax 只追加；改写历史会被 §4.1 链验证拦截，故前缀假设安全）
+- **新增条目** = current 的 `relaxations` 中第 `len(base.relaxations)` 条之后的条目（relax 只追加；current 条目数少于 base 判为**历史截断**直接 fail——纯删尾条目不破坏链上任何哈希，唯有此计数可拦；改写中间条目由 §4.1 链验证拦截）
 - 每个放宽型变更必须被某个新增条目的 `changes` **精确匹配**（按第 5 节规范串逐字符串相等）覆盖，否则 fail 并列出未解释变更
 
 **变更隔离检查**：
@@ -120,7 +120,7 @@ aegkit relax <project-root> --reason "..."
 - 若 `.agent-engineering/policy.json` 有变更，则全部变更路径必须落在白名单：`.agent-engineering/**`、`.github/workflows/engineering-guard.yml`、`ARCHITECTURE.md`
 - 工作流含义：先 relax（纯 policy PR），再代码 PR 用掉自由度——先立法，后用权
 
-**本地/无 base 行为**：未传 `--ci-base` → 跳过两个子检查，打印一行 `NOTE: strict policy isolation is enforced in CI`，不影响退出码（与 `--arch-only` 同一哲学：CI 是执法点）。传了 `--ci-base` 但 git 不可用或调用失败 → fail（遵守"missing tools 永不视为成功"）。
+**本地/无 base 行为**：未传 `--ci-base` → 跳过两个子检查，打印一行 `NOTE: strict policy isolation is enforced in CI`，不影响退出码（与 `--arch-only` 同一哲学：CI 是执法点）。传了 `--ci-base` 但 git 不可用或调用失败 → fail（遵守"missing tools 永不视为成功"）。全零 sha（GitHub 首推的 `github.event.before` 值）视同未传——彼时无 base 可比，不误报首推。
 
 **退出码沿用现有约定**：`PolicyError` → 2；check 失败 → 1；成功 → 0。strict 子检查失败按 check 失败计。
 
@@ -167,3 +167,5 @@ aegkit relax <project-root> --reason "..."
 - **`strict_disabled` 本身是放宽**：关掉 strict 等于关掉全部检查，必须留痕。
 - **modules 成员移除列为第 8 类放宽**（实现期评审发现）：allowlist 收缩会静默消失一批隐式 forbidden 对，恰是本设计要拦的侵蚀路径；relax 的 `--unmanage`/`--remove-module` 自动清理相关边，条目由 diff 精确生成。
 - **strict CI 对畸形 base 策略 fail closed**：base 上 `relaxation_changes` 抛出的任何比较异常都转为检查失败，不以 traceback 冒充基础设施故障，也绝不放行。
+- **历史截断由条目计数拦截**（实现期评审发现）：删掉尾部条目不改变任何链上哈希、物质上也可能零 diff，链验证对此盲视；current 条目数少于 base 即 fail，这是唯一可靠的截断信号。
+- **全零 base 视同未传**：GitHub 首推的 `before` 是全零 sha，彼时没有可比对象，跳过 strict 子检查而非把每次首推打成红。
