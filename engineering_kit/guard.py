@@ -311,6 +311,67 @@ def _run(label: str, argv: list[str], root: Path, env: dict, timeout_seconds: in
     return {"name": label, "passed": code == 0, "exit_code": code}
 
 
+def _git(root: Path, argv: list[str]) -> tuple[int, str]:
+    try:
+        completed = subprocess.run(["git", *argv], cwd=root, text=True, encoding="utf-8",
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PolicyError(f"git unavailable: {exc}")
+    return completed.returncode, completed.stdout
+
+
+def strict_policy_checks(root: Path, policy: dict, base: str) -> list[dict]:
+    """Strict mode gate: every loosening needs a fresh relaxations entry; policy edits stay isolated. CI only."""
+    def fail(detail: str) -> list[dict]:
+        return [{"name": "strict-policy", "passed": False, "exit_code": 1, "detail": detail}]
+
+    code, _ = _git(root, ["rev-parse", "--verify", base])
+    if code:
+        return fail(f"cannot resolve --ci-base ref {base!r}")
+    code, old_text = _git(root, ["show", f"{base}:.agent-engineering/policy.json"])
+    if code:
+        old_policy: object = {}
+    else:
+        try:
+            old_policy = json.loads(old_text)
+        except json.JSONDecodeError:
+            return fail(f"base policy at {base} is not valid JSON")
+    code, names = _git(root, ["diff", "--name-only", f"{base}...HEAD"])
+    if code:
+        return fail("git diff failed: " + names.strip()[:200])
+    problems: list[str] = []
+    if not isinstance(old_policy, dict):
+        problems.append("base policy is not an object")
+    else:
+        try:
+            actual = relaxation_changes(old_policy, policy)
+        except (TypeError, ValueError, KeyError, IndexError, AttributeError) as exc:
+            problems.append(f"cannot compare against base policy at {base}: {exc!r}")
+            actual = []
+        old_entries = old_policy.get("relaxations")
+        old_count = len(old_entries) if isinstance(old_entries, list) else 0
+        fresh = {change for entry in policy.get("relaxations", [])[old_count:]
+                 for change in entry.get("changes", [])}
+        unexplained = [change for change in actual if change not in fresh]
+        if unexplained:
+            problems.append("naked relaxation; record a relaxations entry (aegkit relax): "
+                            + "; ".join(unexplained))
+    changed = [line.strip() for line in names.splitlines() if line.strip()]
+    if ".agent-engineering/policy.json" in changed:
+        def covered(name: str) -> bool:
+            return (name.startswith(".agent-engineering/")
+                    or name == ".github/workflows/engineering-guard.yml"
+                    or name == "ARCHITECTURE.md")
+        stray = sorted({name for name in changed if not covered(name)})
+        if stray:
+            problems.append("policy change must be an isolated PR (allowed: .agent-engineering/**, "
+                            ".github/workflows/engineering-guard.yml, ARCHITECTURE.md); offending: "
+                            + ", ".join(stray))
+    if problems:
+        return fail(" | ".join(problems))
+    return [{"name": "strict-policy", "passed": True, "exit_code": 0}]
+
+
 def check(root: Path, policy: dict, arch_only: bool = False) -> dict:
     if not policy["tests"] and not arch_only:
         raise PolicyError("behavior tests are not configured; set 'tests' or use --arch-only for diagnosis")

@@ -12,7 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from engineering_kit.cli import main as cli_main, parse_rules
 from engineering_kit.guard import (PolicyError, _canonical_sha256, check, load_policy, missing_modules,
-                                   relaxation_changes, render_python, render_typescript, validate_policy)
+                                   relaxation_changes, render_python, render_typescript, strict_policy_checks,
+                                   validate_policy)
 
 
 class KitTests(unittest.TestCase):
@@ -36,6 +37,17 @@ class KitTests(unittest.TestCase):
         config.parent.mkdir(parents=True)
         config.write_text(json.dumps(p), encoding="utf-8")
         return p
+
+    def git_repo_with_base(self, root, old_policy):
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+        config = root / ".agent-engineering" / "policy.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps(old_policy), encoding="utf-8")
+        (root / "app.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
 
     def test_policies_are_validated(self):
         self.assertEqual(validate_policy(self.policy())["language"], "python")
@@ -481,6 +493,64 @@ class KitTests(unittest.TestCase):
         self.assertEqual(relaxation_changes(base, {**base, "check_cycles": False}), [])
         self.assertEqual(relaxation_changes({**base, "check_cycles": True}, {**base, "check_cycles": False}),
                          ["cycles_disabled"])
+
+    def test_strict_checks_block_naked_relaxation_and_mixed_pr(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old = {**self.policy(), "strict": True,
+                   "forbidden": [["learning", "publishing"], ["publishing", "memory"]]}
+            new = {**old, "forbidden": [["learning", "publishing"]]}
+            self.git_repo_with_base(root, old)
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(new), encoding="utf-8")
+            (root / "feature.py").write_text("y = 2\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "loosen plus code"], cwd=root, check=True)
+            result = strict_policy_checks(root, new, "HEAD~1")
+            self.assertFalse(result[0]["passed"])
+            self.assertIn("removed_forbidden: publishing:memory", result[0]["detail"])
+            self.assertIn("feature.py", result[0]["detail"])
+            entry = {"date_utc": "2026-10-11T08:00:00+00:00", "reason": "memory retired",
+                     "changes": ["removed_forbidden: publishing:memory"], "prev_entry_sha256": "0" * 64}
+            isolated = {**new, "relaxations": [entry]}
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(isolated), encoding="utf-8")
+            result = strict_policy_checks(root, isolated, "HEAD~1")
+            self.assertFalse(result[0]["passed"])
+            self.assertNotIn("naked relaxation", result[0]["detail"])
+            self.assertIn("isolated PR", result[0]["detail"])
+            subprocess.run(["git", "add", ".agent-engineering"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "policy only"], cwd=root, check=True)
+            # 累积 diff 语义：base...HEAD 是整个 PR 的累计变更，早前混入的 feature.py 无法被
+            # 后续纯 policy 提交洗白——分支整体仍是混合 PR，必须保持红。
+            result = strict_policy_checks(root, isolated, "HEAD~2")
+            self.assertFalse(result[0]["passed"])
+            self.assertIn("isolated PR", result[0]["detail"])
+            # 全绿场景需要真正隔离的 PR：在干净仓库里从同一 base 只提交 policy。
+            with tempfile.TemporaryDirectory() as clean_temp:
+                clean = Path(clean_temp)
+                self.git_repo_with_base(clean, old)
+                (clean / ".agent-engineering" / "policy.json").write_text(json.dumps(isolated), encoding="utf-8")
+                subprocess.run(["git", "add", ".agent-engineering"], cwd=clean, check=True)
+                subprocess.run(["git", "commit", "-qm", "policy only"], cwd=clean, check=True)
+                result = strict_policy_checks(clean, isolated, "HEAD~1")
+                self.assertTrue(result[0]["passed"])
+            result = strict_policy_checks(root, isolated, "no-such-ref")
+            self.assertFalse(result[0]["passed"])
+
+    def test_strict_checks_fail_closed_on_malformed_base(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.git_repo_with_base(root, {"schema_version": 1, "language": "python",
+                                           "package": "sample", "forbidden": [["a"]]})
+            result = strict_policy_checks(root, self.policy(), "HEAD")
+            self.assertFalse(result[0]["passed"])
+            self.assertIn("cannot compare", result[0]["detail"])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.git_repo_with_base(root, self.policy())
+            result = strict_policy_checks(root, {**self.policy(), "modules": None,
+                                                 "allowed_dependencies": None}, "HEAD")
+            self.assertFalse(result[0]["passed"])
+            self.assertIn("cannot compare", result[0]["detail"])
 
 
 if __name__ == "__main__":
