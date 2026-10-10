@@ -125,14 +125,14 @@ aegkit sync /path/to/your-project
 Setting `"strict": true` in `policy.json` makes silent loosening impossible to merge:
 
 - **Isolated policy PRs.** With a base ref (the generated CI passes one), a `policy.json` change may only touch `.agent-engineering/**`, `engineering-guard.yml`, or `ARCHITECTURE.md`. Land the policy first, then use the new freedom in a separate PR.
-- **No naked relaxations.** Removing a forbidden pair, an allowed edge, a declared module, module coverage, cycle checks, tests, or strict itself requires a `relaxations` entry — a dated, reasoned record chained to the previous entry by SHA-256. Deleting or editing history breaks the chain and fails every check.
+- **No naked relaxations.** Removing a forbidden pair, an allowed edge, a declared module, module coverage, cycle checks, tests, or strict itself requires a `relaxations` entry — a dated, reasoned record chained to the previous entry by SHA-256. Deleting or editing earlier entries breaks the chain and fails every check.
 - **`aegkit relax`.** The only supported way to loosen a strict policy; it refuses empty reasons and refuses anything that is not an actual loosening:
 
 ```bash
 aegkit relax /path/to/your-project --reason "memory layer retired" --remove-forbidden publishing:memory
 ```
 
-Strict mode is opt-in; policies without these fields behave exactly as before. Human review of policy PRs remains the final gate — the chain makes loosening loud and attributable, not impossible.
+Strict mode is opt-in; policies without these fields behave exactly as before. After enabling `strict`, run `aegkit sync` so the vendored guard and CI workflow actually enforce it. Human review of policy PRs remains the final gate — the chain makes loosening loud and attributable, not impossible.
 
 ## Coding-agent cycle
 
