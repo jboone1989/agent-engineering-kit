@@ -42,6 +42,7 @@ class KitTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
         subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=root, check=True)
         subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
         config = root / ".agent-engineering" / "policy.json"
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text(json.dumps(old_policy), encoding="utf-8")
@@ -524,15 +525,33 @@ class KitTests(unittest.TestCase):
             result = strict_policy_checks(root, isolated, "HEAD~2")
             self.assertFalse(result[0]["passed"])
             self.assertIn("isolated PR", result[0]["detail"])
-            # 全绿场景需要真正隔离的 PR：在干净仓库里从同一 base 只提交 policy。
+            # 全绿场景需要真正隔离的 PR：在干净仓库里从同一 base 只提交 policy
+            # （连同两份白名单文件，钉住 whitelist 的每个子句）。
             with tempfile.TemporaryDirectory() as clean_temp:
                 clean = Path(clean_temp)
                 self.git_repo_with_base(clean, old)
                 (clean / ".agent-engineering" / "policy.json").write_text(json.dumps(isolated), encoding="utf-8")
-                subprocess.run(["git", "add", ".agent-engineering"], cwd=clean, check=True)
+                (clean / "ARCHITECTURE.md").write_text("boundaries\n", encoding="utf-8")
+                workflows = clean / ".github" / "workflows"
+                workflows.mkdir(parents=True)
+                (workflows / "engineering-guard.yml").write_text("on: push\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=clean, check=True)
                 subprocess.run(["git", "commit", "-qm", "policy only"], cwd=clean, check=True)
                 result = strict_policy_checks(clean, isolated, "HEAD~1")
                 self.assertTrue(result[0]["passed"])
+            # 纯截断历史：base 带 [entry]、current 原样删掉条目——物质未变、链仍合法，
+            # 唯有"条目数少于 base"能拦住这种植除。
+            with tempfile.TemporaryDirectory() as trunc_temp:
+                trunc = Path(trunc_temp)
+                history = {**old, "relaxations": [entry]}
+                self.git_repo_with_base(trunc, history)
+                truncated = {k: v for k, v in history.items() if k != "relaxations"}
+                (trunc / ".agent-engineering" / "policy.json").write_text(json.dumps(truncated), encoding="utf-8")
+                subprocess.run(["git", "add", ".agent-engineering"], cwd=trunc, check=True)
+                subprocess.run(["git", "commit", "-qm", "erase history"], cwd=trunc, check=True)
+                result = strict_policy_checks(trunc, truncated, "HEAD~1")
+                self.assertFalse(result[0]["passed"])
+                self.assertIn("truncated", result[0]["detail"])
             result = strict_policy_checks(root, isolated, "no-such-ref")
             self.assertFalse(result[0]["passed"])
 

@@ -313,7 +313,7 @@ def _run(label: str, argv: list[str], root: Path, env: dict, timeout_seconds: in
 
 def _git(root: Path, argv: list[str]) -> tuple[int, str]:
     try:
-        completed = subprocess.run(["git", *argv], cwd=root, text=True, encoding="utf-8",
+        completed = subprocess.run(["git", *argv], cwd=root, text=True, encoding="utf-8", errors="replace",
                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PolicyError(f"git unavailable: {exc}")
@@ -329,14 +329,17 @@ def strict_policy_checks(root: Path, policy: dict, base: str) -> list[dict]:
     if code:
         return fail(f"cannot resolve --ci-base ref {base!r}")
     code, old_text = _git(root, ["show", f"{base}:.agent-engineering/policy.json"])
+    old_policy: object = {}
     if code:
-        old_policy: object = {}
+        lsc, listing = _git(root, ["ls-tree", "--name-only", base, "--", ".agent-engineering/policy.json"])
+        if lsc == 0 and listing.strip():
+            return fail(f"cannot read base policy at {base}: {old_text.strip()[:200]}")
     else:
         try:
             old_policy = json.loads(old_text)
         except json.JSONDecodeError:
             return fail(f"base policy at {base} is not valid JSON")
-    code, names = _git(root, ["diff", "--name-only", f"{base}...HEAD"])
+    code, names = _git(root, ["-c", "core.quotePath=false", "diff", "--name-only", f"{base}...HEAD"])
     if code:
         return fail("git diff failed: " + names.strip()[:200])
     problems: list[str] = []
@@ -350,6 +353,8 @@ def strict_policy_checks(root: Path, policy: dict, base: str) -> list[dict]:
             actual = []
         old_entries = old_policy.get("relaxations")
         old_count = len(old_entries) if isinstance(old_entries, list) else 0
+        if len(policy.get("relaxations") or []) < old_count:
+            problems.append("relaxations history was truncated: entries cannot be deleted")
         fresh = {change for entry in policy.get("relaxations", [])[old_count:]
                  for change in entry.get("changes", [])}
         unexplained = [change for change in actual if change not in fresh]
