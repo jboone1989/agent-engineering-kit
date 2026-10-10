@@ -619,6 +619,8 @@ class KitTests(unittest.TestCase):
                 text = workflow(language)
                 self.assertIn("GUARD_CI_BASE", text)
                 self.assertIn("github.event.pull_request.base.sha", text)
+                self.assertIn("github.event.before", text)
+                self.assertIn("fetch-depth: 0", text)
                 self.assertIn('BASE_ARGS+=(--ci-base "$GUARD_CI_BASE")', text)
 
 
