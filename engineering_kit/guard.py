@@ -149,6 +149,41 @@ def forbidden_pairs(policy: dict) -> list[list[str]]:
     return pairs
 
 
+def _test_label(argv: list[str]) -> str:
+    return json.dumps(argv, separators=(",", ":"), ensure_ascii=False)
+
+
+def _effective_check_cycles(policy: dict) -> bool:
+    if "check_cycles" not in policy:
+        return policy["language"] == "typescript"
+    return policy["check_cycles"]
+
+
+def relaxation_changes(old: dict, new: dict) -> list[str]:
+    """Enumerate machine-checkable loosenings from old to new; empty when new is equal or stricter."""
+    changes: list[str] = []
+    old_forbidden = {tuple(pair) for pair in old.get("forbidden", [])}
+    new_forbidden = {tuple(pair) for pair in new.get("forbidden", [])}
+    for src, dst in sorted(old_forbidden - new_forbidden):
+        changes.append(f"removed_forbidden: {src}:{dst}")
+    old_allowed = {tuple(pair) for pair in old.get("allowed_dependencies", [])}
+    new_allowed = {tuple(pair) for pair in new.get("allowed_dependencies", [])}
+    for src, dst in sorted(old_allowed - new_allowed):
+        changes.append(f"removed_allowed: {src}:{dst}")
+    for module in sorted(set(new.get("unmanaged_modules", [])) - set(old.get("unmanaged_modules", []))):
+        changes.append(f"unmanaged: {module}")
+    if old.get("module_coverage", "top_level") == "top_level" and new.get("module_coverage") == "off":
+        changes.append("coverage_off")
+    if _effective_check_cycles(old) and not _effective_check_cycles(new):
+        changes.append("cycles_disabled")
+    old_tests = {_test_label(t) for t in old.get("tests", [])}
+    for label in sorted(old_tests - {_test_label(t) for t in new.get("tests", [])}):
+        changes.append(f"removed_test: {label}")
+    if old.get("strict", False) and not new.get("strict", False):
+        changes.append("strict_disabled")
+    return sorted(changes)
+
+
 def _canonical_sha256(value: object) -> str:
     canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

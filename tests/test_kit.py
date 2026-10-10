@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from engineering_kit.cli import main as cli_main, parse_rules
 from engineering_kit.guard import (PolicyError, _canonical_sha256, check, load_policy, missing_modules,
-                                   render_python, render_typescript, validate_policy)
+                                   relaxation_changes, render_python, render_typescript, validate_policy)
 
 
 class KitTests(unittest.TestCase):
@@ -444,6 +444,34 @@ class KitTests(unittest.TestCase):
                          [second, first]):
             with self.subTest(relaxations=tampered), self.assertRaises(PolicyError):
                 validate_policy({**self.policy(), "relaxations": tampered})
+
+    def test_relaxation_changes_enumerates_all_seven_types(self):
+        old = {"schema_version": 1, "language": "python", "package": "sample", "source": None,
+               "forbidden": [["learning", "publishing"], ["publishing", "memory"]],
+               "allowed_dependencies": [["learning", "memory"]],
+               "modules": ["learning", "publishing", "memory"],
+               "unmanaged_modules": ["scripts"], "module_coverage": "top_level",
+               "check_cycles": True, "strict": True,
+               "tests": [["python", "-m", "pytest", "-q"]]}
+        new = {"schema_version": 1, "language": "python", "package": "sample", "source": None,
+               "forbidden": [["learning", "publishing"]], "allowed_dependencies": [],
+               "modules": ["learning", "publishing", "memory"],
+               "unmanaged_modules": ["scripts", "tools"], "module_coverage": "off",
+               "check_cycles": False, "strict": False, "tests": []}
+        self.assertEqual(relaxation_changes(old, new), [
+            "coverage_off", "cycles_disabled", "removed_allowed: learning:memory",
+            "removed_forbidden: publishing:memory",
+            "removed_test: [\"python\",\"-m\",\"pytest\",\"-q\"]", "strict_disabled", "unmanaged: tools"])
+        self.assertEqual(relaxation_changes(new, old), [])
+
+    def test_cycles_default_differs_by_language(self):
+        base = {"schema_version": 1, "language": "python", "package": "sample", "source": None,
+                "forbidden": [["a", "b"]], "tests": [["x"]]}
+        ts = {**base, "language": "typescript", "package": None, "source": "src"}
+        self.assertEqual(relaxation_changes(ts, {**ts, "check_cycles": False}), ["cycles_disabled"])
+        self.assertEqual(relaxation_changes(base, {**base, "check_cycles": False}), [])
+        self.assertEqual(relaxation_changes({**base, "check_cycles": True}, {**base, "check_cycles": False}),
+                         ["cycles_disabled"])
 
 
 if __name__ == "__main__":
