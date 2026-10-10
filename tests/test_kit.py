@@ -10,7 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from engineering_kit.cli import main as cli_main, parse_rules
+from engineering_kit.cli import main as cli_main, parse_rules, workflow
 from engineering_kit.guard import (PolicyError, _canonical_sha256, check, load_policy, missing_modules,
                                    relaxation_changes, render_python, render_typescript, strict_policy_checks,
                                    validate_policy)
@@ -587,6 +587,7 @@ class KitTests(unittest.TestCase):
             result = check(root, p, arch_only=True, ci_base="HEAD")
             self.assertFalse(result["passed"])
             self.assertEqual(result["checks"][0]["name"], "strict-policy")
+            self.assertEqual(len(result["checks"]), 1)
             result = check(root, p, arch_only=True, ci_base="0" * 40)
             self.assertNotIn("strict-policy", [c["name"] for c in result["checks"]])
 
@@ -611,6 +612,14 @@ class KitTests(unittest.TestCase):
                 os.environ["PATH"] = old
             self.assertTrue(result["passed"])
             self.assertEqual([c["name"] for c in result["checks"]], ["architecture"])
+
+    def test_workflow_wires_ci_base_for_strict_isolation(self):
+        for language in ("python", "typescript"):
+            with self.subTest(language=language):
+                text = workflow(language)
+                self.assertIn("GUARD_CI_BASE", text)
+                self.assertIn("github.event.pull_request.base.sha", text)
+                self.assertIn('BASE_ARGS+=(--ci-base "$GUARD_CI_BASE")', text)
 
 
 if __name__ == "__main__":

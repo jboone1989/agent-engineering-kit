@@ -98,7 +98,12 @@ jobs:
       # The project must contain dependency-cruiser in devDependencies.
 """
     return head + steps + """      - name: Enforce module boundaries and run behavior tests
-        run: python .agent-engineering/guard.py check
+        env:
+          GUARD_CI_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          BASE_ARGS=()
+          if [ -n "$GUARD_CI_BASE" ]; then BASE_ARGS+=(--ci-base "$GUARD_CI_BASE"); fi
+          python .agent-engineering/guard.py check "${BASE_ARGS[@]}"
 """
 
 
