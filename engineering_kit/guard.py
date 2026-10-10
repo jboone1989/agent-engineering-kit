@@ -95,6 +95,32 @@ def validate_policy(value: object) -> dict:
             raise PolicyError("a module cannot be declared and unmanaged")
     elif not rules:
         raise PolicyError("configure forbidden pairs or a modules allowlist")
+    strict = value.get("strict", False)
+    if type(strict) is not bool:
+        raise PolicyError("strict must be a boolean")
+    entries = value.get("relaxations", [])
+    if not isinstance(entries, list):
+        raise PolicyError("relaxations must be a list")
+    previous = "0" * 64
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise PolicyError("each relaxation must be an object")
+        try:
+            datetime.fromisoformat(entry.get("date_utc", ""))
+        except (TypeError, ValueError):
+            raise PolicyError("relaxation date_utc must be an ISO 8601 timestamp")
+        if not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
+            raise PolicyError("relaxation reason must be a non-empty string")
+        changes = entry.get("changes")
+        if (not isinstance(changes, list) or not changes or
+                any(not isinstance(c, str) or not c.strip() for c in changes)):
+            raise PolicyError("relaxation changes must be a non-empty list of non-empty strings")
+        prev = entry.get("prev_entry_sha256")
+        if not isinstance(prev, str) or not re.fullmatch(r"[0-9a-f]{64}", prev):
+            raise PolicyError("relaxation prev_entry_sha256 must be 64 lowercase hex characters")
+        if prev != previous:
+            raise PolicyError("relaxation chain is broken: entries were edited, reordered or deleted")
+        previous = _canonical_sha256(entry)
     tests = value.get("tests")
     if not isinstance(tests, list) or any(not isinstance(t, list) or not t or any(not isinstance(s, str) or not s for s in t) for t in tests):
         raise PolicyError("tests must be a list of non-empty argv arrays")
@@ -123,9 +149,13 @@ def forbidden_pairs(policy: dict) -> list[list[str]]:
     return pairs
 
 
-def policy_fingerprint(policy: dict) -> str:
-    canonical = json.dumps(policy, sort_keys=True, separators=(",", ":"))
+def _canonical_sha256(value: object) -> str:
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def policy_fingerprint(policy: dict) -> str:
+    return _canonical_sha256(policy)
 
 
 def render_python(policy: dict) -> str:

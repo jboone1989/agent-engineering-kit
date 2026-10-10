@@ -11,7 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from engineering_kit.cli import main as cli_main, parse_rules
-from engineering_kit.guard import (PolicyError, check, load_policy, missing_modules,
+from engineering_kit.guard import (PolicyError, _canonical_sha256, check, load_policy, missing_modules,
                                    render_python, render_typescript, validate_policy)
 
 
@@ -416,6 +416,34 @@ class KitTests(unittest.TestCase):
             with patch('engineering_kit.guard.shutil.which', return_value='/usr/bin/npx'):
                 with patch('engineering_kit.guard.subprocess.run', return_value=subprocess.CompletedProcess([], 1)):
                     self.assertEqual(doctor(root, policy), 1)
+
+    def test_strict_and_relaxations_are_validated(self):
+        self.assertEqual(validate_policy({**self.policy(), "strict": True})["strict"], True)
+        self.assertEqual(validate_policy({**self.policy(), "strict": False})["strict"], False)
+        with self.assertRaises(PolicyError):
+            validate_policy({**self.policy(), "strict": "yes"})
+        entry = {"date_utc": "2026-10-11T08:00:00+00:00", "reason": "r", "changes": ["cycles_disabled"],
+                 "prev_entry_sha256": "0" * 64}
+        self.assertEqual(validate_policy({**self.policy(), "relaxations": [entry]})["relaxations"], [entry])
+        for change in ({**entry, "reason": "  "}, {**entry, "changes": []},
+                       {**entry, "changes": ["", "ok"]}, {**entry, "prev_entry_sha256": "xyz"},
+                       {**entry, "date_utc": "not-a-date"}, {**entry, "date_utc": 5}):
+            with self.subTest(change=change), self.assertRaises(PolicyError):
+                validate_policy({**self.policy(), "relaxations": [change]})
+
+    def test_relaxation_chain_detects_tampering(self):
+        first = {"date_utc": "2026-10-11T08:00:00+00:00", "reason": "first",
+                 "changes": ["removed_forbidden: a:b"], "prev_entry_sha256": "0" * 64}
+        second = {"date_utc": "2026-10-11T09:00:00+00:00", "reason": "second",
+                  "changes": ["cycles_disabled"], "prev_entry_sha256": _canonical_sha256(first)}
+        self.assertEqual(
+            validate_policy({**self.policy(), "relaxations": [first, second]})["relaxations"],
+            [first, second])
+        for tampered in ([second],
+                         [{**first, "reason": "edited"}, second],
+                         [second, first]):
+            with self.subTest(relaxations=tampered), self.assertRaises(PolicyError):
+                validate_policy({**self.policy(), "relaxations": tampered})
 
 
 if __name__ == "__main__":
