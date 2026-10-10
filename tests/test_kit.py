@@ -623,6 +623,57 @@ class KitTests(unittest.TestCase):
                 self.assertIn("fetch-depth: 0", text)
                 self.assertIn('BASE_ARGS+=(--ci-base "$GUARD_CI_BASE")', text)
 
+    def test_relax_writes_chained_entry_and_refuses_everything_else(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old = {**self.policy(), "strict": True, "check_cycles": True,
+                   "forbidden": [["learning", "publishing"], ["publishing", "memory"]],
+                   "tests": [[sys.executable, "-c", "print('a')"], [sys.executable, "-c", "print('b')"]]}
+            self.setup_example(root)
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(old), encoding="utf-8")
+            self.assertEqual(cli_main(["relax", str(root), "--reason", "memory retired",
+                                       "--remove-forbidden", "publishing:memory", "--remove-test", "2"]), 0)
+            policy = load_policy(root)
+            self.assertEqual(policy["forbidden"], [["learning", "publishing"]])
+            self.assertEqual(len(policy["relaxations"]), 1)
+            entry = policy["relaxations"][0]
+            self.assertEqual(entry["changes"][0], "removed_forbidden: publishing:memory")
+            self.assertTrue(entry["changes"][1].startswith("removed_test: "))
+            self.assertEqual(entry["reason"], "memory retired")
+            self.assertEqual(entry["prev_entry_sha256"], "0" * 64)
+            second = {"date_utc": "2026-10-11T00:00:00+00:00", "reason": "later",
+                      "changes": ["cycles_disabled"], "prev_entry_sha256": _canonical_sha256(entry)}
+            policy["relaxations"].append(second)
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
+            self.assertEqual(cli_main(["relax", str(root), "--reason", "no cycles", "--no-cycles"]), 0)
+            reloaded = load_policy(root)
+            self.assertEqual(reloaded["check_cycles"], False)
+            self.assertEqual(reloaded["relaxations"][-1]["prev_entry_sha256"], _canonical_sha256(second))
+            wide = load_policy(root)
+            wide["forbidden"] = []
+            wide["modules"] = ["learning", "publishing", "memory"]
+            wide["allowed_dependencies"] = [["learning", "publishing"]]
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(wide), encoding="utf-8")
+            self.assertEqual(cli_main(["relax", str(root), "--reason", "publishing outsourced",
+                                       "--unmanage", "publishing"]), 0)
+            final = load_policy(root)
+            self.assertEqual(final["modules"], ["learning", "memory"])
+            self.assertEqual(final["relaxations"][-1]["changes"],
+                             ["removed_allowed: learning:publishing", "removed_module: publishing",
+                              "unmanaged: publishing"])
+            for argv in (["relax", str(root), "--reason", "  ", "--no-cycles"],
+                         ["relax", str(root), "--reason", "nothing"],
+                         ["relax", str(root), "--reason", "ghost", "--remove-forbidden", "ghost:target"],
+                         ["relax", str(root), "--reason", "dupe",
+                          "--unmanage", "tools", "--unmanage", "tools"]):
+                with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                    cli_main(argv)
+            plain_root = Path(temp) / "plain"
+            plain_root.mkdir()
+            self.setup_example(plain_root)
+            with self.assertRaises(SystemExit):
+                cli_main(["relax", str(plain_root), "--reason", "not strict yet", "--no-cycles"])
+
 
 if __name__ == "__main__":
     unittest.main()
