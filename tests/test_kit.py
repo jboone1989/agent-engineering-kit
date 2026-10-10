@@ -570,6 +570,47 @@ class KitTests(unittest.TestCase):
                                                  "allowed_dependencies": None}, "HEAD")
             self.assertFalse(result[0]["passed"])
             self.assertIn("cannot compare", result[0]["detail"])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.git_repo_with_base(root, {**self.policy(), "relaxations": [
+                {"date_utc": "2026-10-11T08:00:00+00:00", "reason": "r",
+                 "changes": ["removed_forbidden: a:b"], "prev_entry_sha256": "0" * 64}]})
+            result = strict_policy_checks(root, {**self.policy(), "relaxations": None}, "HEAD")
+            self.assertFalse(result[0]["passed"])
+            self.assertIn("truncated", result[0]["detail"])
+
+    def test_strict_policy_with_base_fails_closed_outside_git(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.setup_example(root)
+            p["strict"] = True
+            result = check(root, p, arch_only=True, ci_base="HEAD")
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["checks"][0]["name"], "strict-policy")
+            result = check(root, p, arch_only=True, ci_base="0" * 40)
+            self.assertNotIn("strict-policy", [c["name"] for c in result["checks"]])
+
+    def test_strict_policy_without_base_only_notes(self):
+        if os.name == "nt":
+            self.skipTest("fake POSIX executable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.setup_example(root)
+            p["strict"] = True
+            binpath = root / "bin"
+            binpath.mkdir()
+            fake = binpath / "lint-imports"
+            fake.write_text("#!/bin/sh\ncase \"$1\" in --config) test -f \"$2\";; *) exit 7;; esac\n",
+                            encoding="utf-8")
+            fake.chmod(0o755)
+            old = os.environ.get("PATH", "")
+            try:
+                os.environ["PATH"] = str(binpath) + os.pathsep + old
+                result = check(root, p, arch_only=True)
+            finally:
+                os.environ["PATH"] = old
+            self.assertTrue(result["passed"])
+            self.assertEqual([c["name"] for c in result["checks"]], ["architecture"])
 
 
 if __name__ == "__main__":

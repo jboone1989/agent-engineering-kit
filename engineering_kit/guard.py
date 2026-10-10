@@ -355,7 +355,7 @@ def strict_policy_checks(root: Path, policy: dict, base: str) -> list[dict]:
         old_count = len(old_entries) if isinstance(old_entries, list) else 0
         if len(policy.get("relaxations") or []) < old_count:
             problems.append("relaxations history was truncated: entries cannot be deleted")
-        fresh = {change for entry in policy.get("relaxations", [])[old_count:]
+        fresh = {change for entry in (policy.get("relaxations") or [])[old_count:]
                  for change in entry.get("changes", [])}
         unexplained = [change for change in actual if change not in fresh]
         if unexplained:
@@ -377,7 +377,15 @@ def strict_policy_checks(root: Path, policy: dict, base: str) -> list[dict]:
     return [{"name": "strict-policy", "passed": True, "exit_code": 0}]
 
 
-def check(root: Path, policy: dict, arch_only: bool = False) -> dict:
+def _report(policy: dict, results: list[dict]) -> dict:
+    return {
+        "schema_version": 1, "kit_version": VERSION, "policy_sha256": policy_fingerprint(policy),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "passed": all(r["passed"] for r in results), "checks": results,
+    }
+
+
+def check(root: Path, policy: dict, arch_only: bool = False, ci_base: str | None = None) -> dict:
     if not policy["tests"] and not arch_only:
         raise PolicyError("behavior tests are not configured; set 'tests' or use --arch-only for diagnosis")
     absent = missing_modules(root, policy)
@@ -390,7 +398,19 @@ def check(root: Path, policy: dict, arch_only: bool = False) -> dict:
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([str(root / "src"), str(root), env.get("PYTHONPATH", "")])
     timeout_seconds = policy.get("command_timeout_seconds", 900)
-    results = []
+    results: list[dict] = []
+    if policy.get("strict"):
+        if ci_base and set(ci_base) != {"0"}:
+            results = strict_policy_checks(root, policy, ci_base)
+            for item in results:
+                print(("PASS " if item["passed"] else "FAIL ") + item["name"], flush=True)
+                if not item["passed"]:
+                    print(item["detail"], flush=True)
+            if not all(item["passed"] for item in results):
+                return _report(policy, results)
+        else:
+            # 全零 sha（GitHub 首推的 before 值）视同未传：无 base 可比，不误报首推。
+            print("NOTE: strict policy isolation is enforced in CI (pass --ci-base there)", flush=True)
     with tempfile.TemporaryDirectory(prefix="aegkit-") as temp:
         if policy["language"] == "python":
             config = Path(temp) / ".importlinter"
@@ -413,11 +433,7 @@ def check(root: Path, policy: dict, arch_only: bool = False) -> dict:
     if not arch_only:
         for index, command in enumerate(policy["tests"], 1):
             results.append(_run(f"behavior-{index}", command, root, env, timeout_seconds))
-    return {
-        "schema_version": 1, "kit_version": VERSION, "policy_sha256": policy_fingerprint(policy),
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "passed": all(r["passed"] for r in results), "checks": results,
-    }
+    return _report(policy, results)
 
 
 def doctor(root: Path, policy: dict) -> int:
@@ -459,6 +475,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="project root (default: current directory)")
     parser.add_argument("--arch-only", action="store_true", help="diagnose architecture without behavior tests")
     parser.add_argument("--json-report", type=Path, help="write a concise JSON result only when explicitly requested")
+    parser.add_argument("--ci-base", help="git base ref that enables strict policy checks (CI only)")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     try:
@@ -468,7 +485,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "render-config":
             print(render_python(policy) if policy["language"] == "python" else render_typescript(policy))
             return 0
-        result = check(root, policy, args.arch_only)
+        result = check(root, policy, args.arch_only, args.ci_base)
         if args.json_report:
             args.json_report.parent.mkdir(parents=True, exist_ok=True)
             args.json_report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

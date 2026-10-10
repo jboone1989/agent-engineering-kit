@@ -217,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         if command == "check":
             sub.add_argument("--arch-only", action="store_true")
             sub.add_argument("--json-report", type=Path)
+            sub.add_argument("--ci-base")
     args = parser.parse_args(argv)
     try:
         if args.command == "init":
@@ -230,4 +231,6 @@ def main(argv: list[str] | None = None) -> int:
         guard_args.append("--arch-only")
     if getattr(args, "json_report", None):
         guard_args += ["--json-report", str(args.json_report)]
+    if getattr(args, "ci_base", None):
+        guard_args += ["--ci-base", args.ci_base]
     return guard_main(guard_args)
