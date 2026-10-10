@@ -668,6 +668,13 @@ class KitTests(unittest.TestCase):
                           "--unmanage", "tools", "--unmanage", "tools"]):
                 with self.subTest(argv=argv), self.assertRaises(SystemExit):
                     cli_main(argv)
+            no_allowlist = load_policy(root)
+            no_allowlist["forbidden"] = [["learning", "memory"]]
+            del no_allowlist["modules"]
+            del no_allowlist["allowed_dependencies"]
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(no_allowlist), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                cli_main(["relax", str(root), "--reason", "no allowlist", "--unmanage", "tools"])
             plain_root = Path(temp) / "plain"
             plain_root.mkdir()
             self.setup_example(plain_root)

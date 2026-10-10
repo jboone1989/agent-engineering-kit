@@ -177,6 +177,8 @@ def relax(args: argparse.Namespace) -> int:
         flag = "--unmanage" if unmanage else "--remove-module"
         if unmanage and module in (new.get("unmanaged_modules") or []):
             raise ValueError(f"{flag} {module!r}: module is already unmanaged")
+        if unmanage and "modules" not in new:
+            raise ValueError(f"{flag} {module!r}: policy has no modules allowlist; nothing to unmanage")
         if not unmanage and module not in (new.get("modules") or []):
             raise ValueError(f"{flag} {module!r}: module is not declared in modules")
         if "modules" in new:
