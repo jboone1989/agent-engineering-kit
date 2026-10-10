@@ -191,9 +191,9 @@ def relax(args: argparse.Namespace) -> int:
             new.setdefault("unmanaged_modules", []).append(module)
 
     for pair in args.remove_forbidden:
-        drop_pair("forbidden", pair, "forbidden")
+        drop_pair("forbidden", pair, "remove-forbidden")
     for pair in args.remove_allowed:
-        drop_pair("allowed_dependencies", pair, "allowed")
+        drop_pair("allowed_dependencies", pair, "remove-allowed")
     for module in args.unmanage:
         remove_module(module, unmanage=True)
     for module in args.remove_module:
