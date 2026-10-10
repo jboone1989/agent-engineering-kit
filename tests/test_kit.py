@@ -445,7 +445,7 @@ class KitTests(unittest.TestCase):
             with self.subTest(relaxations=tampered), self.assertRaises(PolicyError):
                 validate_policy({**self.policy(), "relaxations": tampered})
 
-    def test_relaxation_changes_enumerates_all_seven_types(self):
+    def test_relaxation_changes_enumerates_all_eight_types(self):
         old = {"schema_version": 1, "language": "python", "package": "sample", "source": None,
                "forbidden": [["learning", "publishing"], ["publishing", "memory"]],
                "allowed_dependencies": [["learning", "memory"]],
@@ -455,14 +455,23 @@ class KitTests(unittest.TestCase):
                "tests": [["python", "-m", "pytest", "-q"]]}
         new = {"schema_version": 1, "language": "python", "package": "sample", "source": None,
                "forbidden": [["learning", "publishing"]], "allowed_dependencies": [],
-               "modules": ["learning", "publishing", "memory"],
+               "modules": ["learning", "publishing"],
                "unmanaged_modules": ["scripts", "tools"], "module_coverage": "off",
                "check_cycles": False, "strict": False, "tests": []}
         self.assertEqual(relaxation_changes(old, new), [
             "coverage_off", "cycles_disabled", "removed_allowed: learning:memory",
-            "removed_forbidden: publishing:memory",
+            "removed_forbidden: publishing:memory", "removed_module: memory",
             "removed_test: [\"python\",\"-m\",\"pytest\",\"-q\"]", "strict_disabled", "unmanaged: tools"])
         self.assertEqual(relaxation_changes(new, old), [])
+
+    def test_relaxation_changes_tolerates_sparse_and_empty_bases(self):
+        self.assertEqual(relaxation_changes({}, self.policy()), [])
+        old = {**self.policy(), "forbidden": [["a", "b"], ["c", "d"], ["e", "f"]]}
+        self.assertEqual(relaxation_changes(old, {**old, "forbidden": [["c", "d"]]}),
+                         ["removed_forbidden: a:b", "removed_forbidden: e:f"])
+        off = {**self.policy(), "modules": ["learning", "publishing"], "module_coverage": "off"}
+        self.assertEqual(relaxation_changes(off, self.policy()),
+                         ["removed_module: learning", "removed_module: publishing"])
 
     def test_cycles_default_differs_by_language(self):
         base = {"schema_version": 1, "language": "python", "package": "sample", "source": None,

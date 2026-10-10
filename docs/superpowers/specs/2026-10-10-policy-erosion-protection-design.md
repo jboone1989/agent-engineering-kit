@@ -72,12 +72,15 @@ AEK 的核心承诺是 policy.json 是边界的唯一事实源、CI 强制执行
 | 3 | unmanaged_modules 新增 | new 有、old 无 | `unmanaged: <module>` |
 | 4 | module_coverage 关闭 | old 有效值 `top_level`、new 为 `off` | `coverage_off` |
 | 5 | 循环检查关闭 | old 有效值 true、new 有效值 false | `cycles_disabled` |
-| 6 | tests 条目移除 | old 有、new 无（按条目标识比较） | `removed_test: <json.dumps(argv, separators=(",",":"))>` |
+| 6 | tests 条目移除 | old 有、new 无（按条目标识比较） | `removed_test: <json.dumps(argv, separators=(",", ":"), ensure_ascii=False)>` |
 | 7 | strict 关闭 | old true、new false | `strict_disabled` |
+| 8 | modules 成员移除 | old 有、new 无（含移入 `unmanaged_modules` 或整删 `modules`） | `removed_module: <module>` |
 
 收紧方向（加 forbidden、加 modules、加 allowed 边、coverage 开启、cycles 开启、加 tests、strict 开启）不需要条目——欢迎的方向不设摩擦。
 
 **tests 修改按"移除+新增"处理**：换测试命令的移除侧也需要条目。宁可误伤（改个等价命令也要理由），不可漏放。
+
+**modules 移除（实现期评审修订，2026-10-11）**：从 `modules` 移除成员（或整删字段）会静默消失一批隐式 forbidden 对——正是第 1 节描述的侵蚀路径，而收紧清单里的"加 modules"暗示其逆操作必须留痕，故列为第 8 类。第 8 类**不受 `module_coverage` 影响**：`forbidden_pairs` 无论 coverage 取值都把 allowlist 展开成隐式 forbidden 对，allowlist 收缩删的都是真实生效的约束。把成员移入 `unmanaged_modules` 会同时触发 `unmanaged:` 与 `removed_module:` 两个串，条目如实并列。`{}`（policy 文件不存在的 base）按"什么都没开"处理：不触发任何放宽串，首次启用 strict 不误伤。
 
 ## 6. 两个执法点
 
@@ -86,11 +89,13 @@ AEK 的核心承诺是 policy.json 是边界的唯一事实源、CI 强制执行
 ```
 aegkit relax <project-root> --reason "..."
     [--remove-forbidden src:dst]... [--remove-allowed src:dst]...
-    [--unmanage module]... [--coverage-off] [--no-cycles]
+    [--remove-module module]... [--unmanage module]... [--coverage-off] [--no-cycles]
     [--remove-test N]... [--strict-off]
 ```
 
-流程：读旧 policy → 应用变更 → `validate_policy(new)` → 判定变更集合，若不含任何 §5 放宽型变更则报错不写 → 追加条目（`date_utc` 取当前 UTC，`changes` 生成规范串，`prev_entry_sha256` 接链）→ 写回 → 打印条目摘要。
+模块语义：`--unmanage` 把成员移入 `unmanaged_modules`，若其已声明在 `modules` 中则同时移出；`--remove-module` 把已声明成员移出 `modules`（代码已删除/迁走的场景）。两者都自动清理涉及该模块的 `allowed_dependencies` 边；`--remove-module` 额外清理其显式 forbidden 对（模块消失后这些对只会触发 missing-modules fail）。条目的 `changes` 不逐 flag 手拼，直接取 `relaxation_changes(old, new)` 的精确产出——CLI 不复制 §5 的判定逻辑。
+
+流程：读旧 policy → 应用变更 → `validate_policy(new)` → 用 `relaxation_changes(old, new)` 判定变更集合，若为空（等价或更严）则报错不写 → 追加条目（`date_utc` 取当前 UTC，`changes` 即上述集合，`prev_entry_sha256` 接链）→ 写回 → 打印条目摘要。
 
 拒绝规则（均 exit 2，不写回）：
 - `--reason` 缺失或空白
@@ -132,7 +137,7 @@ aegkit relax <project-root> --reason "..."
 ## 9. 测试计划（沿用现有 mock 风格）
 
 1. `validate_policy`：strict 非 bool 拒绝；relaxations 条目缺字段、空 reason、坏 hex、首条 prev 非全零、链条断裂——逐一拒绝；合法链通过。
-2. 放宽 diff：第 5 节七类逐一识别；收紧集合识别为空；Python/TypeScript 的 `check_cycles` 缺省语义分别覆盖。
+2. 放宽 diff：第 5 节八类逐一识别；收紧集合识别为空；Python/TypeScript 的 `check_cycles` 缺省语义分别覆盖；`{}` 与缺字段 base 不误伤、不崩溃。
 3. naked relaxation：base+current+条目覆盖 → 过；缺条目 → fail 且列出缺失变更；条目在 base 已存在（非新增）→ 不算覆盖。
 4. 隔离：mock `git diff --name-only` 输出，白名单内/外两态；policy 无变更时不触发。
 5. relax CLI：正常写入并接链；空理由拒；仅收紧拒；产出非法拒；strict=false 拒。
@@ -160,3 +165,5 @@ aegkit relax <project-root> --reason "..."
 - **relax 在 kit CLI 不在 guard**：抬高 agent 绕过成本（目标项目未装 kit）；guard 保持只读。
 - **tests 修改从严**：移除侧需要条目，宁可误伤不漏放。
 - **`strict_disabled` 本身是放宽**：关掉 strict 等于关掉全部检查，必须留痕。
+- **modules 成员移除列为第 8 类放宽**（实现期评审发现）：allowlist 收缩会静默消失一批隐式 forbidden 对，恰是本设计要拦的侵蚀路径；relax 的 `--unmanage`/`--remove-module` 自动清理相关边，条目由 diff 精确生成。
+- **strict CI 对畸形 base 策略 fail closed**：base 上 `relaxation_changes` 抛出的任何比较异常都转为检查失败，不以 traceback 冒充基础设施故障，也绝不放行。

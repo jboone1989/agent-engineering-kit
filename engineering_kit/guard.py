@@ -155,7 +155,7 @@ def _test_label(argv: list[str]) -> str:
 
 def _effective_check_cycles(policy: dict) -> bool:
     if "check_cycles" not in policy:
-        return policy["language"] == "typescript"
+        return policy.get("language") == "typescript"
     return policy["check_cycles"]
 
 
@@ -172,6 +172,8 @@ def relaxation_changes(old: dict, new: dict) -> list[str]:
         changes.append(f"removed_allowed: {src}:{dst}")
     for module in sorted(set(new.get("unmanaged_modules", [])) - set(old.get("unmanaged_modules", []))):
         changes.append(f"unmanaged: {module}")
+    for module in sorted(set(old.get("modules", [])) - set(new.get("modules", []))):
+        changes.append(f"removed_module: {module}")
     if old.get("module_coverage", "top_level") == "top_level" and new.get("module_coverage") == "off":
         changes.append("coverage_off")
     if _effective_check_cycles(old) and not _effective_check_cycles(new):
