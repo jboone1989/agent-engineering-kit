@@ -199,6 +199,8 @@ def relax(args: argparse.Namespace) -> int:
     for module in args.remove_module:
         remove_module(module, unmanage=False)
     if args.coverage_off:
+        if "modules" not in new:
+            raise ValueError("--coverage-off: policy has no modules allowlist; coverage is already unbounded")
         if new.get("module_coverage") == "off":
             raise ValueError("--coverage-off: module coverage is already off")
         new["module_coverage"] = "off"
@@ -206,6 +208,10 @@ def relax(args: argparse.Namespace) -> int:
         if not new.get("check_cycles", new["language"] == "typescript"):
             raise ValueError("--no-cycles: cycle checking is already disabled")
         new["check_cycles"] = False
+    if len(set(args.remove_test)) != len(args.remove_test):
+        raise ValueError("--remove-test: duplicate index; indexes shift after each removal, so a repeated"
+                         " index silently removes a different test (pass each test's current index once,"
+                         " highest first)")
     for index in args.remove_test:
         if not 1 <= index <= len(new["tests"]):
             raise ValueError(f"--remove-test {index}: out of range (1-{len(new['tests'])});"
@@ -228,6 +234,7 @@ def relax(args: argparse.Namespace) -> int:
     (root / ".agent-engineering" / "policy.json").write_text(json.dumps(new, indent=2) + "\n", encoding="utf-8")
     print("RELAXED:", "; ".join(actual))
     print("REASON:", reason)
+    print("ENTRY_SHA256:", _canonical_sha256(entry))
     return 0
 
 def init(args: argparse.Namespace) -> int:

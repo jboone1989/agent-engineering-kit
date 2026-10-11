@@ -430,6 +430,25 @@ class KitTests(unittest.TestCase):
                 with patch('engineering_kit.guard.subprocess.run', return_value=subprocess.CompletedProcess([], 1)):
                     self.assertEqual(doctor(root, policy), 1)
 
+    def test_strict_doctor_detects_stale_vendored_guard_and_workflow(self):
+        from unittest.mock import patch
+        from engineering_kit.guard import doctor
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            policy = {**self.setup_example(root), "strict": True}
+            (root / '.github/workflows').mkdir(parents=True)
+            stale_workflow = root / '.github/workflows/engineering-guard.yml'
+            stale_workflow.write_text('name: engineering-guard\n', encoding='utf-8')
+            stale_guard = root / '.agent-engineering/guard.py'
+            stale_guard.write_text('# vendored guard without strict support\n', encoding='utf-8')
+            current_guard = (ROOT / 'engineering_kit/guard.py').read_text(encoding='utf-8')
+            with patch('engineering_kit.guard.shutil.which', return_value='/usr/bin/lint-imports'):
+                self.assertEqual(doctor(root, policy), 1)
+                stale_guard.write_text(current_guard, encoding='utf-8')
+                self.assertEqual(doctor(root, policy), 1)
+                stale_workflow.write_text(workflow('python'), encoding='utf-8')
+                self.assertEqual(doctor(root, policy), 0)
+
     def test_strict_and_relaxations_are_validated(self):
         self.assertEqual(validate_policy({**self.policy(), "strict": True})["strict"], True)
         self.assertEqual(validate_policy({**self.policy(), "strict": False})["strict"], False)
@@ -440,7 +459,9 @@ class KitTests(unittest.TestCase):
         self.assertEqual(validate_policy({**self.policy(), "relaxations": [entry]})["relaxations"], [entry])
         for change in ({**entry, "reason": "  "}, {**entry, "changes": []},
                        {**entry, "changes": ["", "ok"]}, {**entry, "prev_entry_sha256": "xyz"},
-                       {**entry, "date_utc": "not-a-date"}, {**entry, "date_utc": 5}):
+                       {**entry, "date_utc": "not-a-date"}, {**entry, "date_utc": 5},
+                       {**entry, "date_utc": "2026-10-11T08:00:00"},
+                       {**entry, "date_utc": "2026-10-11T08:00:00+02:00"}):
             with self.subTest(change=change), self.assertRaises(PolicyError):
                 validate_policy({**self.policy(), "relaxations": [change]})
 
@@ -680,6 +701,48 @@ class KitTests(unittest.TestCase):
             self.setup_example(plain_root)
             with self.assertRaises(SystemExit):
                 cli_main(["relax", str(plain_root), "--reason", "not strict yet", "--no-cycles"])
+
+    def test_relax_direct_paths_cover_remaining_loosening_kinds(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.setup_example(root)
+            pairs_only = {**self.policy(), "strict": True}
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(pairs_only), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                cli_main(["relax", str(root), "--reason", "no allowlist", "--coverage-off"])
+            self.assertIsNone(load_policy(root).get("relaxations"))
+
+            full_root = Path(temp) / "full"
+            full_root.mkdir()
+            self.setup_example(full_root)
+            base = {**self.policy(), "strict": True, "check_cycles": True,
+                    "modules": ["learning", "publishing", "memory"],
+                    "allowed_dependencies": [["learning", "memory"]],
+                    "forbidden": [["learning", "publishing"]],
+                    "tests": [[sys.executable, "-c", "print('a')"], [sys.executable, "-c", "print('b')"]]}
+            (full_root / ".agent-engineering" / "policy.json").write_text(json.dumps(base), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                cli_main(["relax", str(full_root), "--reason", "shifted",
+                          "--remove-test", "2", "--remove-test", "2"])
+            self.assertIsNone(load_policy(full_root).get("relaxations"))
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(cli_main(["relax", str(full_root), "--reason", "restructure",
+                                           "--remove-allowed", "learning:memory", "--coverage-off",
+                                           "--remove-module", "memory", "--strict-off"]), 0)
+            final = load_policy(full_root)
+            self.assertEqual(final["allowed_dependencies"], [])
+            self.assertEqual(final["module_coverage"], "off")
+            self.assertEqual(final["modules"], ["learning", "publishing"])
+            self.assertIs(final["strict"], False)
+            entry = final["relaxations"][-1]
+            self.assertEqual(sorted(entry["changes"]),
+                             ["coverage_off", "removed_allowed: learning:memory",
+                              "removed_module: memory", "strict_disabled"])
+            self.assertEqual(entry["prev_entry_sha256"], "0" * 64)
+            self.assertIn(f"ENTRY_SHA256: {_canonical_sha256(entry)}", stdout.getvalue())
 
 
 if __name__ == "__main__":
