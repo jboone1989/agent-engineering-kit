@@ -15,9 +15,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 PY_MODULE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
 TS_MODULE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*(/[a-zA-Z_][a-zA-Z0-9_-]*)*$")
 PACKAGE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
@@ -32,7 +32,8 @@ def _source_path(value: str) -> str:
     if not isinstance(value, str) or not SOURCE.fullmatch(value):
         raise PolicyError("source must be a simple relative path")
     result = Path(value)
-    if result.is_absolute() or any(part in (".", "..") for part in value.split("/")):
+    # Leading "/" is absolute on POSIX even though Windows Path.is_absolute says otherwise.
+    if result.is_absolute() or value.startswith("/") or any(part in (".", "..") for part in value.split("/")):
         raise PolicyError("source cannot leave the project directory")
     return value.rstrip("/")
 
@@ -106,9 +107,11 @@ def validate_policy(value: object) -> dict:
         if not isinstance(entry, dict):
             raise PolicyError("each relaxation must be an object")
         try:
-            datetime.fromisoformat(entry.get("date_utc", ""))
+            stamp = datetime.fromisoformat(entry.get("date_utc", ""))
         except (TypeError, ValueError):
             raise PolicyError("relaxation date_utc must be an ISO 8601 timestamp")
+        if stamp.tzinfo is None or stamp.utcoffset() != timedelta(0):
+            raise PolicyError("relaxation date_utc must carry a UTC offset (+00:00 or Z)")
         if not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
             raise PolicyError("relaxation reason must be a non-empty string")
         changes = entry.get("changes")
@@ -462,6 +465,13 @@ def doctor(root: Path, policy: dict) -> int:
             issues.append("dependency-cruiser unavailable or version probe timed out")
     if not (root / ".github/workflows/engineering-guard.yml").is_file():
         issues.append("CI workflow missing")
+    if policy.get("strict"):
+        vendored_guard = root / ".agent-engineering/guard.py"
+        if vendored_guard.is_file() and "--ci-base" not in vendored_guard.read_text(encoding="utf-8"):
+            issues.append("strict policy but vendored guard.py predates strict mode (no --ci-base); run aegkit sync")
+        workflow_file = root / ".github/workflows/engineering-guard.yml"
+        if workflow_file.is_file() and "GUARD_CI_BASE" not in workflow_file.read_text(encoding="utf-8"):
+            issues.append("strict policy but CI workflow does not pass GUARD_CI_BASE; run aegkit sync")
     for issue in issues:
         print("ISSUE:", issue)
     if not issues:
