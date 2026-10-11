@@ -120,6 +120,20 @@ aegkit sync /path/to/your-project
 
 `sync` updates only kit-owned runner/CI files whose content still matches the last generated version (`managed.json` hash). It **never edits** `policy.json`, `AGENTS.md`, or `ARCHITECTURE.md`. If an integrator changed the runner or workflow, AEK refuses the overwrite and asks for a manual merge. For a v0.1 project, adopt the new policy and guard first; its old scaffolder did not create a managed manifest.
 
+### Policy erosion protection (strict mode)
+
+Setting `"strict": true` in `policy.json` makes silent loosening impossible to merge:
+
+- **Isolated policy PRs.** With a base ref (the generated CI passes one), a `policy.json` change may only touch `.agent-engineering/**`, `engineering-guard.yml`, or `ARCHITECTURE.md`. Land the policy first, then use the new freedom in a separate PR.
+- **No naked relaxations.** Removing a forbidden pair, an allowed edge, a declared module, module coverage, cycle checks, tests, or strict itself requires a `relaxations` entry — a dated, reasoned record chained to the previous entry by SHA-256. Deleting or editing earlier entries breaks the chain and fails every check.
+- **`aegkit relax`.** The only supported way to loosen a strict policy; it refuses empty reasons and refuses anything that is not an actual loosening:
+
+```bash
+aegkit relax /path/to/your-project --reason "memory layer retired" --remove-forbidden publishing:memory
+```
+
+Strict mode is opt-in; policies without these fields behave exactly as before. After enabling `strict`, run `aegkit sync` so the vendored guard and CI workflow actually enforce it. Human review of policy PRs remains the final gate — the chain makes loosening loud and attributable, not impossible.
+
 ## Coding-agent cycle
 
 1. Identify the owning module and public API before coding.
@@ -149,6 +163,7 @@ By default, `check` **fails** if behavior tests are not configured. `--arch-only
 - Validity or coverage of a project's test suite.
 - Branch protection: you must configure a GitHub ruleset requiring `quality-gate` and review on policy changes.
 - A policy can still be weakened in the same PR unless a reviewer / CODEOWNERS / ruleset protects it.
+- Erosion that humans approve: the relaxations chain records and exposes loosening, but a reviewed `aegkit relax` is by design allowed. The chain stops silent erosion, not decided erosion.
 
 **Important:** a build passing the generated guard is necessary, not sufficient, for maintainable software. AEK intentionally does not introduce another agent, memory system, or policy server.
 

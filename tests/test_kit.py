@@ -10,9 +10,10 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from engineering_kit.cli import main as cli_main, parse_rules
-from engineering_kit.guard import (PolicyError, check, load_policy, missing_modules,
-                                   render_python, render_typescript, validate_policy)
+from engineering_kit.cli import main as cli_main, parse_rules, workflow
+from engineering_kit.guard import (PolicyError, _canonical_sha256, check, load_policy, missing_modules,
+                                   relaxation_changes, render_python, render_typescript, strict_policy_checks,
+                                   validate_policy)
 
 
 class KitTests(unittest.TestCase):
@@ -36,6 +37,18 @@ class KitTests(unittest.TestCase):
         config.parent.mkdir(parents=True)
         config.write_text(json.dumps(p), encoding="utf-8")
         return p
+
+    def git_repo_with_base(self, root, old_policy):
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=root, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+        subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
+        config = root / ".agent-engineering" / "policy.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps(old_policy), encoding="utf-8")
+        (root / "app.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=root, check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=root, check=True)
 
     def test_policies_are_validated(self):
         self.assertEqual(validate_policy(self.policy())["language"], "python")
@@ -416,6 +429,257 @@ class KitTests(unittest.TestCase):
             with patch('engineering_kit.guard.shutil.which', return_value='/usr/bin/npx'):
                 with patch('engineering_kit.guard.subprocess.run', return_value=subprocess.CompletedProcess([], 1)):
                     self.assertEqual(doctor(root, policy), 1)
+
+    def test_strict_and_relaxations_are_validated(self):
+        self.assertEqual(validate_policy({**self.policy(), "strict": True})["strict"], True)
+        self.assertEqual(validate_policy({**self.policy(), "strict": False})["strict"], False)
+        with self.assertRaises(PolicyError):
+            validate_policy({**self.policy(), "strict": "yes"})
+        entry = {"date_utc": "2026-10-11T08:00:00+00:00", "reason": "r", "changes": ["cycles_disabled"],
+                 "prev_entry_sha256": "0" * 64}
+        self.assertEqual(validate_policy({**self.policy(), "relaxations": [entry]})["relaxations"], [entry])
+        for change in ({**entry, "reason": "  "}, {**entry, "changes": []},
+                       {**entry, "changes": ["", "ok"]}, {**entry, "prev_entry_sha256": "xyz"},
+                       {**entry, "date_utc": "not-a-date"}, {**entry, "date_utc": 5}):
+            with self.subTest(change=change), self.assertRaises(PolicyError):
+                validate_policy({**self.policy(), "relaxations": [change]})
+
+    def test_relaxation_chain_detects_tampering(self):
+        first = {"date_utc": "2026-10-11T08:00:00+00:00", "reason": "first",
+                 "changes": ["removed_forbidden: a:b"], "prev_entry_sha256": "0" * 64}
+        second = {"date_utc": "2026-10-11T09:00:00+00:00", "reason": "second",
+                  "changes": ["cycles_disabled"], "prev_entry_sha256": _canonical_sha256(first)}
+        self.assertEqual(
+            validate_policy({**self.policy(), "relaxations": [first, second]})["relaxations"],
+            [first, second])
+        for tampered in ([second],
+                         [{**first, "reason": "edited"}, second],
+                         [second, first]):
+            with self.subTest(relaxations=tampered), self.assertRaises(PolicyError):
+                validate_policy({**self.policy(), "relaxations": tampered})
+
+    def test_relaxation_changes_enumerates_all_eight_types(self):
+        old = {"schema_version": 1, "language": "python", "package": "sample", "source": None,
+               "forbidden": [["learning", "publishing"], ["publishing", "memory"]],
+               "allowed_dependencies": [["learning", "memory"]],
+               "modules": ["learning", "publishing", "memory"],
+               "unmanaged_modules": ["scripts"], "module_coverage": "top_level",
+               "check_cycles": True, "strict": True,
+               "tests": [["python", "-m", "pytest", "-q"]]}
+        new = {"schema_version": 1, "language": "python", "package": "sample", "source": None,
+               "forbidden": [["learning", "publishing"]], "allowed_dependencies": [],
+               "modules": ["learning", "publishing"],
+               "unmanaged_modules": ["scripts", "tools"], "module_coverage": "off",
+               "check_cycles": False, "strict": False, "tests": []}
+        self.assertEqual(relaxation_changes(old, new), [
+            "coverage_off", "cycles_disabled", "removed_allowed: learning:memory",
+            "removed_forbidden: publishing:memory", "removed_module: memory",
+            "removed_test: [\"python\",\"-m\",\"pytest\",\"-q\"]", "strict_disabled", "unmanaged: tools"])
+        self.assertEqual(relaxation_changes(new, old), [])
+
+    def test_relaxation_changes_tolerates_sparse_and_empty_bases(self):
+        self.assertEqual(relaxation_changes({}, self.policy()), [])
+        old = {**self.policy(), "forbidden": [["a", "b"], ["c", "d"], ["e", "f"]]}
+        self.assertEqual(relaxation_changes(old, {**old, "forbidden": [["c", "d"]]}),
+                         ["removed_forbidden: a:b", "removed_forbidden: e:f"])
+        off = {**self.policy(), "modules": ["learning", "publishing"], "module_coverage": "off"}
+        self.assertEqual(relaxation_changes(off, self.policy()),
+                         ["removed_module: learning", "removed_module: publishing"])
+
+    def test_cycles_default_differs_by_language(self):
+        base = {"schema_version": 1, "language": "python", "package": "sample", "source": None,
+                "forbidden": [["a", "b"]], "tests": [["x"]]}
+        ts = {**base, "language": "typescript", "package": None, "source": "src"}
+        self.assertEqual(relaxation_changes(ts, {**ts, "check_cycles": False}), ["cycles_disabled"])
+        self.assertEqual(relaxation_changes(base, {**base, "check_cycles": False}), [])
+        self.assertEqual(relaxation_changes({**base, "check_cycles": True}, {**base, "check_cycles": False}),
+                         ["cycles_disabled"])
+
+    def test_strict_checks_block_naked_relaxation_and_mixed_pr(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old = {**self.policy(), "strict": True,
+                   "forbidden": [["learning", "publishing"], ["publishing", "memory"]]}
+            new = {**old, "forbidden": [["learning", "publishing"]]}
+            self.git_repo_with_base(root, old)
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(new), encoding="utf-8")
+            (root / "feature.py").write_text("y = 2\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "loosen plus code"], cwd=root, check=True)
+            result = strict_policy_checks(root, new, "HEAD~1")
+            self.assertFalse(result[0]["passed"])
+            self.assertIn("removed_forbidden: publishing:memory", result[0]["detail"])
+            self.assertIn("feature.py", result[0]["detail"])
+            entry = {"date_utc": "2026-10-11T08:00:00+00:00", "reason": "memory retired",
+                     "changes": ["removed_forbidden: publishing:memory"], "prev_entry_sha256": "0" * 64}
+            isolated = {**new, "relaxations": [entry]}
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(isolated), encoding="utf-8")
+            result = strict_policy_checks(root, isolated, "HEAD~1")
+            self.assertFalse(result[0]["passed"])
+            self.assertNotIn("naked relaxation", result[0]["detail"])
+            self.assertIn("isolated PR", result[0]["detail"])
+            subprocess.run(["git", "add", ".agent-engineering"], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "policy only"], cwd=root, check=True)
+            # 累积 diff 语义：base...HEAD 是整个 PR 的累计变更，早前混入的 feature.py 无法被
+            # 后续纯 policy 提交洗白——分支整体仍是混合 PR，必须保持红。
+            result = strict_policy_checks(root, isolated, "HEAD~2")
+            self.assertFalse(result[0]["passed"])
+            self.assertIn("isolated PR", result[0]["detail"])
+            # 全绿场景需要真正隔离的 PR：在干净仓库里从同一 base 只提交 policy
+            # （连同两份白名单文件，钉住 whitelist 的每个子句）。
+            with tempfile.TemporaryDirectory() as clean_temp:
+                clean = Path(clean_temp)
+                self.git_repo_with_base(clean, old)
+                (clean / ".agent-engineering" / "policy.json").write_text(json.dumps(isolated), encoding="utf-8")
+                (clean / "ARCHITECTURE.md").write_text("boundaries\n", encoding="utf-8")
+                workflows = clean / ".github" / "workflows"
+                workflows.mkdir(parents=True)
+                (workflows / "engineering-guard.yml").write_text("on: push\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=clean, check=True)
+                subprocess.run(["git", "commit", "-qm", "policy only"], cwd=clean, check=True)
+                result = strict_policy_checks(clean, isolated, "HEAD~1")
+                self.assertTrue(result[0]["passed"])
+            # 纯截断历史：base 带 [entry]、current 原样删掉条目——物质未变、链仍合法，
+            # 唯有"条目数少于 base"能拦住这种植除。
+            with tempfile.TemporaryDirectory() as trunc_temp:
+                trunc = Path(trunc_temp)
+                history = {**old, "relaxations": [entry]}
+                self.git_repo_with_base(trunc, history)
+                truncated = {k: v for k, v in history.items() if k != "relaxations"}
+                (trunc / ".agent-engineering" / "policy.json").write_text(json.dumps(truncated), encoding="utf-8")
+                subprocess.run(["git", "add", ".agent-engineering"], cwd=trunc, check=True)
+                subprocess.run(["git", "commit", "-qm", "erase history"], cwd=trunc, check=True)
+                result = strict_policy_checks(trunc, truncated, "HEAD~1")
+                self.assertFalse(result[0]["passed"])
+                self.assertIn("truncated", result[0]["detail"])
+            result = strict_policy_checks(root, isolated, "no-such-ref")
+            self.assertFalse(result[0]["passed"])
+
+    def test_strict_checks_fail_closed_on_malformed_base(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.git_repo_with_base(root, {"schema_version": 1, "language": "python",
+                                           "package": "sample", "forbidden": [["a"]]})
+            result = strict_policy_checks(root, self.policy(), "HEAD")
+            self.assertFalse(result[0]["passed"])
+            self.assertIn("cannot compare", result[0]["detail"])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.git_repo_with_base(root, self.policy())
+            result = strict_policy_checks(root, {**self.policy(), "modules": None,
+                                                 "allowed_dependencies": None}, "HEAD")
+            self.assertFalse(result[0]["passed"])
+            self.assertIn("cannot compare", result[0]["detail"])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.git_repo_with_base(root, {**self.policy(), "relaxations": [
+                {"date_utc": "2026-10-11T08:00:00+00:00", "reason": "r",
+                 "changes": ["removed_forbidden: a:b"], "prev_entry_sha256": "0" * 64}]})
+            result = strict_policy_checks(root, {**self.policy(), "relaxations": None}, "HEAD")
+            self.assertFalse(result[0]["passed"])
+            self.assertIn("truncated", result[0]["detail"])
+
+    def test_strict_policy_with_base_fails_closed_outside_git(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.setup_example(root)
+            p["strict"] = True
+            result = check(root, p, arch_only=True, ci_base="HEAD")
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["checks"][0]["name"], "strict-policy")
+            self.assertEqual(len(result["checks"]), 1)
+            result = check(root, p, arch_only=True, ci_base="0" * 40)
+            self.assertNotIn("strict-policy", [c["name"] for c in result["checks"]])
+
+    def test_strict_policy_without_base_only_notes(self):
+        if os.name == "nt":
+            self.skipTest("fake POSIX executable")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            p = self.setup_example(root)
+            p["strict"] = True
+            binpath = root / "bin"
+            binpath.mkdir()
+            fake = binpath / "lint-imports"
+            fake.write_text("#!/bin/sh\ncase \"$1\" in --config) test -f \"$2\";; *) exit 7;; esac\n",
+                            encoding="utf-8")
+            fake.chmod(0o755)
+            old = os.environ.get("PATH", "")
+            try:
+                os.environ["PATH"] = str(binpath) + os.pathsep + old
+                result = check(root, p, arch_only=True)
+            finally:
+                os.environ["PATH"] = old
+            self.assertTrue(result["passed"])
+            self.assertEqual([c["name"] for c in result["checks"]], ["architecture"])
+
+    def test_workflow_wires_ci_base_for_strict_isolation(self):
+        for language in ("python", "typescript"):
+            with self.subTest(language=language):
+                text = workflow(language)
+                self.assertIn("GUARD_CI_BASE", text)
+                self.assertIn("github.event.pull_request.base.sha", text)
+                self.assertIn("github.event.before", text)
+                self.assertIn("fetch-depth: 0", text)
+                self.assertIn('BASE_ARGS+=(--ci-base "$GUARD_CI_BASE")', text)
+
+    def test_relax_writes_chained_entry_and_refuses_everything_else(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            old = {**self.policy(), "strict": True, "check_cycles": True,
+                   "forbidden": [["learning", "publishing"], ["publishing", "memory"]],
+                   "tests": [[sys.executable, "-c", "print('a')"], [sys.executable, "-c", "print('b')"]]}
+            self.setup_example(root)
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(old), encoding="utf-8")
+            self.assertEqual(cli_main(["relax", str(root), "--reason", "memory retired",
+                                       "--remove-forbidden", "publishing:memory", "--remove-test", "2"]), 0)
+            policy = load_policy(root)
+            self.assertEqual(policy["forbidden"], [["learning", "publishing"]])
+            self.assertEqual(len(policy["relaxations"]), 1)
+            entry = policy["relaxations"][0]
+            self.assertEqual(entry["changes"][0], "removed_forbidden: publishing:memory")
+            self.assertTrue(entry["changes"][1].startswith("removed_test: "))
+            self.assertEqual(entry["reason"], "memory retired")
+            self.assertEqual(entry["prev_entry_sha256"], "0" * 64)
+            second = {"date_utc": "2026-10-11T00:00:00+00:00", "reason": "later",
+                      "changes": ["cycles_disabled"], "prev_entry_sha256": _canonical_sha256(entry)}
+            policy["relaxations"].append(second)
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(policy), encoding="utf-8")
+            self.assertEqual(cli_main(["relax", str(root), "--reason", "no cycles", "--no-cycles"]), 0)
+            reloaded = load_policy(root)
+            self.assertEqual(reloaded["check_cycles"], False)
+            self.assertEqual(reloaded["relaxations"][-1]["prev_entry_sha256"], _canonical_sha256(second))
+            wide = load_policy(root)
+            wide["forbidden"] = []
+            wide["modules"] = ["learning", "publishing", "memory"]
+            wide["allowed_dependencies"] = [["learning", "publishing"]]
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(wide), encoding="utf-8")
+            self.assertEqual(cli_main(["relax", str(root), "--reason", "publishing outsourced",
+                                       "--unmanage", "publishing"]), 0)
+            final = load_policy(root)
+            self.assertEqual(final["modules"], ["learning", "memory"])
+            self.assertEqual(final["relaxations"][-1]["changes"],
+                             ["removed_allowed: learning:publishing", "removed_module: publishing",
+                              "unmanaged: publishing"])
+            for argv in (["relax", str(root), "--reason", "  ", "--no-cycles"],
+                         ["relax", str(root), "--reason", "nothing"],
+                         ["relax", str(root), "--reason", "ghost", "--remove-forbidden", "ghost:target"],
+                         ["relax", str(root), "--reason", "dupe",
+                          "--unmanage", "tools", "--unmanage", "tools"]):
+                with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                    cli_main(argv)
+            no_allowlist = load_policy(root)
+            no_allowlist["forbidden"] = [["learning", "memory"]]
+            del no_allowlist["modules"]
+            del no_allowlist["allowed_dependencies"]
+            (root / ".agent-engineering" / "policy.json").write_text(json.dumps(no_allowlist), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                cli_main(["relax", str(root), "--reason", "no allowlist", "--unmanage", "tools"])
+            plain_root = Path(temp) / "plain"
+            plain_root.mkdir()
+            self.setup_example(plain_root)
+            with self.assertRaises(SystemExit):
+                cli_main(["relax", str(plain_root), "--reason", "not strict yet", "--no-cycles"])
 
 
 if __name__ == "__main__":

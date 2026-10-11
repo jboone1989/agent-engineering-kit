@@ -17,7 +17,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 
-VERSION = "0.3.3"
+VERSION = "0.4.0"
 PY_MODULE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
 TS_MODULE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_-]*(/[a-zA-Z_][a-zA-Z0-9_-]*)*$")
 PACKAGE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
@@ -95,6 +95,32 @@ def validate_policy(value: object) -> dict:
             raise PolicyError("a module cannot be declared and unmanaged")
     elif not rules:
         raise PolicyError("configure forbidden pairs or a modules allowlist")
+    strict = value.get("strict", False)
+    if type(strict) is not bool:
+        raise PolicyError("strict must be a boolean")
+    entries = value.get("relaxations", [])
+    if not isinstance(entries, list):
+        raise PolicyError("relaxations must be a list")
+    previous = "0" * 64
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise PolicyError("each relaxation must be an object")
+        try:
+            datetime.fromisoformat(entry.get("date_utc", ""))
+        except (TypeError, ValueError):
+            raise PolicyError("relaxation date_utc must be an ISO 8601 timestamp")
+        if not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
+            raise PolicyError("relaxation reason must be a non-empty string")
+        changes = entry.get("changes")
+        if (not isinstance(changes, list) or not changes or
+                any(not isinstance(c, str) or not c.strip() for c in changes)):
+            raise PolicyError("relaxation changes must be a non-empty list of non-empty strings")
+        prev = entry.get("prev_entry_sha256")
+        if not isinstance(prev, str) or not re.fullmatch(r"[0-9a-f]{64}", prev):
+            raise PolicyError("relaxation prev_entry_sha256 must be 64 lowercase hex characters")
+        if prev != previous:
+            raise PolicyError("relaxation chain is broken: entries were edited, reordered or deleted")
+        previous = _canonical_sha256(entry)
     tests = value.get("tests")
     if not isinstance(tests, list) or any(not isinstance(t, list) or not t or any(not isinstance(s, str) or not s for s in t) for t in tests):
         raise PolicyError("tests must be a list of non-empty argv arrays")
@@ -123,9 +149,50 @@ def forbidden_pairs(policy: dict) -> list[list[str]]:
     return pairs
 
 
-def policy_fingerprint(policy: dict) -> str:
-    canonical = json.dumps(policy, sort_keys=True, separators=(",", ":"))
+def _test_label(argv: list[str]) -> str:
+    return json.dumps(argv, separators=(",", ":"), ensure_ascii=False)
+
+
+def _effective_check_cycles(policy: dict) -> bool:
+    if "check_cycles" not in policy:
+        return policy.get("language") == "typescript"
+    return policy["check_cycles"]
+
+
+def relaxation_changes(old: dict, new: dict) -> list[str]:
+    """Enumerate machine-checkable loosenings from old to new; empty when new is equal or stricter."""
+    changes: list[str] = []
+    old_forbidden = {tuple(pair) for pair in old.get("forbidden", [])}
+    new_forbidden = {tuple(pair) for pair in new.get("forbidden", [])}
+    for src, dst in sorted(old_forbidden - new_forbidden):
+        changes.append(f"removed_forbidden: {src}:{dst}")
+    old_allowed = {tuple(pair) for pair in old.get("allowed_dependencies", [])}
+    new_allowed = {tuple(pair) for pair in new.get("allowed_dependencies", [])}
+    for src, dst in sorted(old_allowed - new_allowed):
+        changes.append(f"removed_allowed: {src}:{dst}")
+    for module in sorted(set(new.get("unmanaged_modules", [])) - set(old.get("unmanaged_modules", []))):
+        changes.append(f"unmanaged: {module}")
+    for module in sorted(set(old.get("modules", [])) - set(new.get("modules", []))):
+        changes.append(f"removed_module: {module}")
+    if old.get("module_coverage", "top_level") == "top_level" and new.get("module_coverage") == "off":
+        changes.append("coverage_off")
+    if _effective_check_cycles(old) and not _effective_check_cycles(new):
+        changes.append("cycles_disabled")
+    old_tests = {_test_label(t) for t in old.get("tests", [])}
+    for label in sorted(old_tests - {_test_label(t) for t in new.get("tests", [])}):
+        changes.append(f"removed_test: {label}")
+    if old.get("strict", False) and not new.get("strict", False):
+        changes.append("strict_disabled")
+    return sorted(changes)
+
+
+def _canonical_sha256(value: object) -> str:
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def policy_fingerprint(policy: dict) -> str:
+    return _canonical_sha256(policy)
 
 
 def render_python(policy: dict) -> str:
@@ -244,7 +311,81 @@ def _run(label: str, argv: list[str], root: Path, env: dict, timeout_seconds: in
     return {"name": label, "passed": code == 0, "exit_code": code}
 
 
-def check(root: Path, policy: dict, arch_only: bool = False) -> dict:
+def _git(root: Path, argv: list[str]) -> tuple[int, str]:
+    try:
+        completed = subprocess.run(["git", *argv], cwd=root, text=True, encoding="utf-8", errors="replace",
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PolicyError(f"git unavailable: {exc}")
+    return completed.returncode, completed.stdout
+
+
+def strict_policy_checks(root: Path, policy: dict, base: str) -> list[dict]:
+    """Strict mode gate: every loosening needs a fresh relaxations entry; policy edits stay isolated. CI only."""
+    def fail(detail: str) -> list[dict]:
+        return [{"name": "strict-policy", "passed": False, "exit_code": 1, "detail": detail}]
+
+    code, _ = _git(root, ["rev-parse", "--verify", base])
+    if code:
+        return fail(f"cannot resolve --ci-base ref {base!r}")
+    code, old_text = _git(root, ["show", f"{base}:.agent-engineering/policy.json"])
+    old_policy: object = {}
+    if code:
+        lsc, listing = _git(root, ["ls-tree", "--name-only", base, "--", ".agent-engineering/policy.json"])
+        if lsc == 0 and listing.strip():
+            return fail(f"cannot read base policy at {base}: {old_text.strip()[:200]}")
+    else:
+        try:
+            old_policy = json.loads(old_text)
+        except json.JSONDecodeError:
+            return fail(f"base policy at {base} is not valid JSON")
+    code, names = _git(root, ["-c", "core.quotePath=false", "diff", "--name-only", f"{base}...HEAD"])
+    if code:
+        return fail("git diff failed: " + names.strip()[:200])
+    problems: list[str] = []
+    if not isinstance(old_policy, dict):
+        problems.append("base policy is not an object")
+    else:
+        try:
+            actual = relaxation_changes(old_policy, policy)
+        except (TypeError, ValueError, KeyError, IndexError, AttributeError) as exc:
+            problems.append(f"cannot compare against base policy at {base}: {exc!r}")
+            actual = []
+        old_entries = old_policy.get("relaxations")
+        old_count = len(old_entries) if isinstance(old_entries, list) else 0
+        if len(policy.get("relaxations") or []) < old_count:
+            problems.append("relaxations history was truncated: entries cannot be deleted")
+        fresh = {change for entry in (policy.get("relaxations") or [])[old_count:]
+                 for change in entry.get("changes", [])}
+        unexplained = [change for change in actual if change not in fresh]
+        if unexplained:
+            problems.append("naked relaxation; record a relaxations entry (aegkit relax): "
+                            + "; ".join(unexplained))
+    changed = [line.strip() for line in names.splitlines() if line.strip()]
+    if ".agent-engineering/policy.json" in changed:
+        def covered(name: str) -> bool:
+            return (name.startswith(".agent-engineering/")
+                    or name == ".github/workflows/engineering-guard.yml"
+                    or name == "ARCHITECTURE.md")
+        stray = sorted({name for name in changed if not covered(name)})
+        if stray:
+            problems.append("policy change must be an isolated PR (allowed: .agent-engineering/**, "
+                            ".github/workflows/engineering-guard.yml, ARCHITECTURE.md); offending: "
+                            + ", ".join(stray))
+    if problems:
+        return fail(" | ".join(problems))
+    return [{"name": "strict-policy", "passed": True, "exit_code": 0}]
+
+
+def _report(policy: dict, results: list[dict]) -> dict:
+    return {
+        "schema_version": 1, "kit_version": VERSION, "policy_sha256": policy_fingerprint(policy),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "passed": all(r["passed"] for r in results), "checks": results,
+    }
+
+
+def check(root: Path, policy: dict, arch_only: bool = False, ci_base: str | None = None) -> dict:
     if not policy["tests"] and not arch_only:
         raise PolicyError("behavior tests are not configured; set 'tests' or use --arch-only for diagnosis")
     absent = missing_modules(root, policy)
@@ -257,7 +398,19 @@ def check(root: Path, policy: dict, arch_only: bool = False) -> dict:
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([str(root / "src"), str(root), env.get("PYTHONPATH", "")])
     timeout_seconds = policy.get("command_timeout_seconds", 900)
-    results = []
+    results: list[dict] = []
+    if policy.get("strict"):
+        if ci_base and set(ci_base) != {"0"}:
+            results = strict_policy_checks(root, policy, ci_base)
+            for item in results:
+                print(("PASS " if item["passed"] else "FAIL ") + item["name"], flush=True)
+                if not item["passed"]:
+                    print(item["detail"], flush=True)
+            if not all(item["passed"] for item in results):
+                return _report(policy, results)
+        else:
+            # 全零 sha（GitHub 首推的 before 值）视同未传：无 base 可比，不误报首推。
+            print("NOTE: strict policy isolation is enforced in CI (pass --ci-base there)", flush=True)
     with tempfile.TemporaryDirectory(prefix="aegkit-") as temp:
         if policy["language"] == "python":
             config = Path(temp) / ".importlinter"
@@ -280,11 +433,7 @@ def check(root: Path, policy: dict, arch_only: bool = False) -> dict:
     if not arch_only:
         for index, command in enumerate(policy["tests"], 1):
             results.append(_run(f"behavior-{index}", command, root, env, timeout_seconds))
-    return {
-        "schema_version": 1, "kit_version": VERSION, "policy_sha256": policy_fingerprint(policy),
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "passed": all(r["passed"] for r in results), "checks": results,
-    }
+    return _report(policy, results)
 
 
 def doctor(root: Path, policy: dict) -> int:
@@ -326,6 +475,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="project root (default: current directory)")
     parser.add_argument("--arch-only", action="store_true", help="diagnose architecture without behavior tests")
     parser.add_argument("--json-report", type=Path, help="write a concise JSON result only when explicitly requested")
+    parser.add_argument("--ci-base", help="git base ref that enables strict policy checks (CI only)")
     args = parser.parse_args(argv)
     root = args.root.resolve()
     try:
@@ -335,7 +485,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "render-config":
             print(render_python(policy) if policy["language"] == "python" else render_typescript(policy))
             return 0
-        result = check(root, policy, args.arch_only)
+        result = check(root, policy, args.arch_only, args.ci_base)
         if args.json_report:
             args.json_report.parent.mkdir(parents=True, exist_ok=True)
             args.json_report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")

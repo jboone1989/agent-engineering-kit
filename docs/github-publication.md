@@ -59,3 +59,13 @@ Check `enforcement: active`, the exact `refs/heads/main` target and all expected
 ## Current limitations
 
 The helper scripts prepare authenticated GitHub actions; they do not themselves provide credentials or bypass GitHub permissions, account login, plan limitations or approval gates. Publishing the source and installing Rulesets are separate steps. Any failure must remain visible; do not claim publication or protection until GitHub confirms it.
+
+## Protecting policy changes with CODEOWNERS
+
+For initialized projects, add a `.github/CODEOWNERS` line so policy edits always request the owner's review:
+
+```
+.agent-engineering/policy.json    @your-org/architecture-owners
+```
+
+Pair this with strict mode: the guard makes loosening loud (isolated PR, reasoned chain), and the ruleset makes sure a human actually looks at that PR.
